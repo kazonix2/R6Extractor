@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <UseWindowsForms>true</UseWindowsForms>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <NoWarn>$(NoWarn);WFO1000</NoWarn>
+        <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Update="Controls\MinimalSplitContainer.cs">
+            <SubType>UserControl</SubType>
+        </Compile>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+        <PackageReference Include="ObjectListView.Official" Version="2.9.2-alpha2" />
+        <PackageReference Include="OpenTK.GLControl" Version="3.1.0" />
+        <PackageReference Include="SkiaSharp" Version="2.88.0-preview.120" />
+        <PackageReference Include="SkiaSharp.Views.WindowsForms" Version="2.88.0-preview.120" />
+        <PackageReference Include="System.Runtime.Serialization.Formatters" Version="9.0.0" />
+        <PackageReference Include="System.Drawing.Common" Version="6.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\RainbowForge\RainbowForge.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Remove="Resources\checker.jpg" />
+        <None Remove="Resources\model.frag" />
+        <None Remove="Resources\radiancevenicematcap.png" />
+        <None Remove="Resources\reflectionvenicematcap.png" />
+        <None Remove="Resources\venice_sunset_2k.png" />
+        <EmbeddedResource Include="Resources\model.frag">
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <None Remove="Resources\model.vert" />
+        <EmbeddedResource Include="Resources\model.vert">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <None Remove="Resources\screen.frag" />
+        <EmbeddedResource Include="Resources\radiancevenicematcap.png">
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <EmbeddedResource Include="Resources\reflectionvenicematcap.png">
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <EmbeddedResource Include="Resources\screen.frag">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <None Remove="Resources\screen.vert" />
+        <EmbeddedResource Include="Resources\screen.vert">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <EmbeddedResource Include="Resources\venice_sunset_2k.png">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </EmbeddedResource>
+        <None Remove="Resources\uv_debug.png" />
+        <EmbeddedResource Include="Resources\uv_debug.png" />
+        <None Remove="Resources\bone.obj" />
+        <EmbeddedResource Include="Resources\bone.obj" />
+    </ItemGroup>
+
+</Project>
