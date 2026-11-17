@@ -7,6 +7,9 @@ Based on top of two forks of RainbowForge.
 - DumpTool = works from Y2S3 -> Y11S3
 - Prism = Works from Y2S3-Y11S1
 
+See [early-season filesystem unpacking](docs/LEGACY-UNPACK.md) for the LZO format and
+[Y11S2 filesystem unpacking](docs/Y11S2-FILESYSTEM.md) for the current archive samples.
+
 # Credits
 
 - [Original Repo](https://github.com/parzivail/RainbowForge)

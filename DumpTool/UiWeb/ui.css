@@ -1,0 +1,24 @@
+:root {
+  color-scheme: dark;
+  font: 16px/1.5 "Barlow", system-ui, sans-serif;
+  background: #10141a;
+  color: #eef2f7;
+}
+body { margin: 0; }
+header, main { max-width: 78rem; margin: auto; padding: 1rem 1.5rem; }
+header, form { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+header { justify-content: space-between; border-bottom: 1px solid #3b4756; }
+h1 { margin: 0; font-size: 1.7rem; }
+a { color: #91d5ff; }
+input, select, button { padding: .55rem .7rem; font: inherit; }
+#resources {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+  gap: .8rem;
+}
+article { border: 1px solid #3b4756; background: #19202a; padding: .85rem; overflow-wrap: anywhere; }
+article img { display: block; width: 100%; height: 8rem; object-fit: contain; background: #0c0f13; }
+article h2 { font-size: 1rem; margin: .5rem 0 .25rem; }
+article p { margin: .4rem 0; color: #b9c5d4; }
+article ul { padding-left: 1.25rem; }
+#more { margin-top: 1rem; }

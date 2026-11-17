@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
@@ -23,7 +23,6 @@ using RainbowForge.Image;
 using RainbowForge.Link;
 using RainbowForge.Model;
 using RainbowForge.RenderPipeline;
-using RainbowForge.Sound;
 using SkiaSharp;
 
 namespace Prism
@@ -34,31 +33,16 @@ namespace Prism
 		private SurfaceRenderer _renderer2d;
 
 		private Forge _openedForge;
-		private Dictionary<ulong, ulong> _flatArchiveEntryMap;
+
 		private AssetDependencyResolver _dependencyResolver;
 		private CancellationTokenSource _previewCancellation;
 
-		[Browsable(false)]
-		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-		public Forge OpenedForge
-		{
-			get => _openedForge;
-			set
-			{
-				_previewCancellation?.Cancel();
-				_dependencyResolver?.Dispose();
-				_openedForge = value;
-				_dependencyResolver = new AssetDependencyResolver(_openedForge.SourcePath);
-				_flatArchiveEntryMap = new Dictionary<ulong, ulong>();
-				_assetList.SetObjects(_openedForge.Entries, _openedForge, _flatArchiveEntryMap);
-				UpdateAbility(null);
-				_assetList.SelectFirstNode();
+		private readonly Dictionary<Forge, AssetDependencyResolver> _loadedForges = new();
 
-				// Exact v31-v33 types are resolved from payloads asynchronously by the
-				// asset tree. Do not summarize the structural FlatArchive classification
-				// here as though it were the entries' actual file type.
-				_statusForgeInfo.Text = $"{_openedForge.NumEntries:N0} entries";
-			}
+		private void ActivateForge(Forge forge)
+		{
+			_openedForge = forge;
+			_dependencyResolver = _loadedForges[forge];
 		}
 
 		private void DumpSelectionAsBin(string outputDir, object o)
@@ -227,45 +211,55 @@ namespace Prism
 		{
 			return o switch
 			{
-				Entry e => new AssetMetaData(e.Uid, e.MetaData.FileType, 0, e.MetaData.FileName),
-				FlatArchiveEntry fae => new AssetMetaData(fae.MetaData.Uid, fae.MetaData.FileType, fae.MetaData.ContainerType, fae.MetaData.FileName),
+				Entry e => new AssetMetaData(e.Uid, e.MetaData?.FileType ?? 0, 0, e.MetaData?.FileName ?? $"{e.Uid:X16}"),
+				FlatArchiveEntry fae => new AssetMetaData(fae.MetaData?.Uid ?? 0, fae.MetaData?.FileType ?? 0, fae.MetaData?.ContainerType ?? 0, fae.MetaData?.FileName ?? $"{fae.MetaData?.Uid ?? 0:X16}"),
 				_ => null
 			};
 		}
 
-		private AssetMetaData GetDetectedAssetMetaData(Entry entry)
+		private AssetMetaData GetDetectedAssetMetaData(Entry entry, Forge forge)
 		{
 			var meta = GetAssetMetaData(entry);
-			return meta with { Magic = AssetTypeDetector.DetectMagic(_openedForge, entry) };
+			return meta with { Magic = AssetTypeDetector.DetectMagic(forge, entry) };
 		}
 
 		private AssetStream GetAssetStream(object o)
 		{
+			var forge = _assetList.GetForge(o);
+			if (forge == null)
+				return null;
 			switch (o)
 			{
 				case Entry entry:
 				{
-					var container = _openedForge.GetContainer(entry.Uid);
+					var container = forge.GetContainer(entry.Uid);
 
 					return container switch
 					{
-						ForgeAsset forgeAsset => new AssetStream(AssetStreamType.ForgeEntry, GetDetectedAssetMetaData(entry), () => forgeAsset.GetDataStream(_openedForge)),
-						_ => new AssetStream(AssetStreamType.ForgeEntry, GetAssetMetaData(entry), () => _openedForge.GetEntryStream(entry))
+						ForgeAsset forgeAsset => new AssetStream(AssetStreamType.ForgeEntry, GetDetectedAssetMetaData(entry, forge), () => forgeAsset.GetDataStream(forge)),
+						RawRiffAsset riff => new AssetStream(AssetStreamType.ForgeEntry, GetDetectedAssetMetaData(entry, forge), () => riff.GetDataStream(forge)),
+						_ => new AssetStream(AssetStreamType.ForgeEntry, GetDetectedAssetMetaData(entry, forge), () => forge.GetEntryStream(entry))
 					};
 				}
 				case FlatArchiveEntry flatArchiveEntry:
 				{
-					var container = _openedForge.GetContainer(_flatArchiveEntryMap[flatArchiveEntry.MetaData.Uid]);
+					if (flatArchiveEntry?.MetaData == null || _assetList.GetParent(flatArchiveEntry) is not { } parent)
+						return null;
+
+					var container = forge.GetContainer(parent.Uid);
 					if (container is not ForgeAsset forgeAsset)
 						return null;
 
 					return new AssetStream(AssetStreamType.ArchiveEntry, GetAssetMetaData(flatArchiveEntry),
 						() =>
 						{
-							using var assetStream = forgeAsset.GetDataStream(_openedForge);
-							var arc = FlatArchive.Read(_openedForge, forgeAsset, assetStream);
-							return arc.GetEntryPayloadStream(assetStream.BaseStream, flatArchiveEntry.MetaData.Uid, _openedForge.Version);
-						});
+							using var assetStream = forgeAsset.GetDataStream(forge);
+							var arc = FlatArchive.Read(forge, forgeAsset, assetStream);
+							// Texture.Read consumes the resource header as part of the texture record.
+							if (MagicHelper.GetFiletype(flatArchiveEntry.MetaData.FileType) is AssetType.Texture or AssetType.Sound)
+								return arc.GetEntryStream(assetStream.BaseStream, flatArchiveEntry.MetaData.Uid);
+							return arc.GetEntryPayloadStream(assetStream.BaseStream, flatArchiveEntry.MetaData.Uid, forge.Version);
+						}) { ParentUid = parent.Uid };
 				}
 			}
 
@@ -275,8 +269,9 @@ namespace Prism
 		private bool IsWorldScene(AssetStream assetStream) =>
 			assetStream != null
 			&& assetStream.StreamType == AssetStreamType.ForgeEntry
-			&& (MagicHelper.Equals(Magic.World, assetStream.MetaData.Magic)
-			    || MagicHelper.Equals(Magic.LoadUnit, assetStream.MetaData.Magic));
+			&& ((Magic)assetStream.MetaData.Magic is Magic.World or Magic.WorldY11S3 or Magic.LoadUnit or Magic.LoadUnitY11S3);
+
+		internal static bool IsLoadUnit(ulong magic) => (Magic)magic is Magic.LoadUnit or Magic.LoadUnitY11S3;
 
 		private List<TexturedSceneMesh> BuildWorldScene(AssetStream assetStream, CancellationToken cancellationToken, Action<string> progress)
 			=> BuildWorldScene(assetStream, cancellationToken, progress, null, loadTextures: true);
@@ -287,209 +282,254 @@ namespace Prism
 
 		private List<TexturedSceneMesh> BuildWorldScene(AssetStream assetStream, CancellationToken cancellationToken,
 			Action<string> progress, Action<IReadOnlyList<TexturedSceneMesh>, IReadOnlyList<SceneLight>> chunkReady,
-			bool loadTextures)
+			bool loadTextures, Forge forge = null, AssetDependencyResolver resolver = null)
 		{
-			var loadUnitUids = MagicHelper.Equals(Magic.LoadUnit, assetStream.MetaData.Magic)
+			forge ??= _openedForge;
+			resolver ??= _dependencyResolver;
+			var loadUnitUids = IsLoadUnit(assetStream.MetaData.Magic)
 				? new[] { assetStream.MetaData.Uid }
-				: _openedForge.Entries
-					.Where(entry => AssetTypeDetector.DetectMagic(_openedForge, entry, inspectPayload: true) == (ulong)Magic.LoadUnit)
+				: forge.Entries
+					.Where(entry => IsLoadUnit(AssetTypeDetector.DetectMagic(forge, entry, inspectPayload: true)))
 					.Select(entry => entry.Uid)
 					.ToArray();
 
 			var scene = new List<TexturedSceneMesh>();
 			var textureCache = new Dictionary<ulong, SceneTextureData>();
-			try
+			Exception firstLoadError = null;
+			for (var index = 0; index < loadUnitUids.Length; index++)
 			{
-				for (var index = 0; index < loadUnitUids.Length; index++)
+				cancellationToken.ThrowIfCancellationRequested();
+				progress?.Invoke($"Loading LoadUnit {index + 1:N0}/{loadUnitUids.Length:N0}...");
+				try
 				{
-					cancellationToken.ThrowIfCancellationRequested();
-					progress?.Invoke($"Loading LoadUnit {index + 1:N0}/{loadUnitUids.Length:N0}...");
-					try
-					{
-						var streamedMeshCount = 0;
-						Action<TexturedSceneMesh, IReadOnlyList<SceneLight>> meshReady = null;
-						if (chunkReady != null)
-							meshReady = (mesh, lights) =>
-							{
-								streamedMeshCount++;
-								scene.Add(mesh);
-								chunkReady([mesh], lights);
-							};
-						var result = BuildLoadUnitScene(loadUnitUids[index], textureCache, cancellationToken, progress,
-							meshReady, loadTextures);
-						if (chunkReady == null && result.Meshes.Count > 0)
+					var streamedMeshCount = 0;
+					Action<TexturedSceneMesh, IReadOnlyList<SceneLight>> meshReady = null;
+					if (chunkReady != null)
+						meshReady = (mesh, lights) =>
 						{
-							scene.AddRange(result.Meshes);
-						}
-						else if (streamedMeshCount == 0 && result.Lights.Count > 0)
-							chunkReady?.Invoke(Array.Empty<TexturedSceneMesh>(), result.Lights);
-					}
-					catch (OperationCanceledException)
+							streamedMeshCount++;
+							scene.Add(mesh);
+							chunkReady([mesh], lights);
+						};
+					var result = BuildLoadUnitScene(loadUnitUids[index], textureCache, cancellationToken, progress,
+						meshReady, loadTextures, forge, resolver);
+					if (chunkReady == null && result.Meshes.Count > 0)
 					{
-						throw;
+						scene.AddRange(result.Meshes);
 					}
-					catch
-					{
-						// A World can contain optional or partially installed LoadUnits. Keep
-						// rendering the dependencies that are available locally.
-					}
+					else if (streamedMeshCount == 0 && result.Lights.Count > 0)
+						chunkReady?.Invoke(Array.Empty<TexturedSceneMesh>(), result.Lights);
 				}
+				catch (OperationCanceledException)
+				{
+					throw;
+				}
+				catch (Exception error)
+				{
+					// A World can contain optional or partially installed LoadUnits. Keep
+					// rendering the dependencies that are available locally.
+					firstLoadError ??= error;
+				}
+			}
 
-				if (scene.Count == 0)
-					throw new InvalidDataException("No renderable Mesh dependencies were found for this World/LoadUnit.");
-				return scene;
-			}
-			catch
-			{
-				throw;
-			}
+			if (scene.Count == 0)
+				throw new InvalidDataException("No renderable mesh placements were found for this World/LoadUnit.", firstLoadError);
+			return scene;
 		}
 
 		private sealed record LoadUnitSceneResult(List<TexturedSceneMesh> Meshes, List<SceneLight> Lights);
 
 		private LoadUnitSceneResult BuildLoadUnitScene(ulong loadUnitUid, Dictionary<ulong, SceneTextureData> textureCache,
 			CancellationToken cancellationToken, Action<string> progress,
-			Action<TexturedSceneMesh, IReadOnlyList<SceneLight>> meshReady = null, bool loadTextures = true)
+			Action<TexturedSceneMesh, IReadOnlyList<SceneLight>> meshReady, bool loadTextures, Forge forge, AssetDependencyResolver resolver)
 		{
-			if (_openedForge.GetContainer(loadUnitUid) is not ForgeAsset loadUnitAsset)
+			if (forge.GetContainer(loadUnitUid) is not ForgeAsset loadUnitAsset)
 				return new LoadUnitSceneResult([], []);
 
-			using var payload = loadUnitAsset.GetDataStream(_openedForge);
-			var archive = FlatArchive.Read(_openedForge, loadUnitAsset, payload);
-			var entities = SceneLightingReader.ReadEntitiesAndLights(_openedForge, archive, payload.BaseStream);
-			var meshEntries = archive.Entries.Where(entry => entry.MetaData.FileType == (uint)Magic.Mesh).ToArray();
+			using var payload = loadUnitAsset.GetDataStream(forge);
+			var archive = FlatArchive.Read(forge, loadUnitAsset, payload);
+			return BuildArchiveScene(archive, payload.BaseStream, textureCache, cancellationToken, progress, meshReady, loadTextures, forge, resolver);
+		}
+
+		private LoadUnitSceneResult BuildArchiveScene(FlatArchive archive, Stream payload,
+			Dictionary<ulong, SceneTextureData> textureCache, CancellationToken cancellationToken,
+			Action<string> progress, Action<TexturedSceneMesh, IReadOnlyList<SceneLight>> meshReady, bool loadTextures, Forge forge, AssetDependencyResolver resolver,
+			ulong? entityUid = null)
+		{
+			var entities = SceneLightingReader.ReadEntitiesAndLights(forge, archive, payload,
+				readLights: !entityUid.HasValue, entityUid: entityUid);
+			var meshEntries = archive.Entries.Where(entry => SceneLightingReader.IsMesh(entry.MetaData.FileType)).ToArray();
 			var scene = new List<TexturedSceneMesh>();
+			var materials = new SceneMaterialReader(archive, payload, forge.Version);
+			Exception firstMeshError = null;
 
 			for (var meshEntryIndex = 0; meshEntryIndex < meshEntries.Length; meshEntryIndex++)
 			{
 				var meshEntry = meshEntries[meshEntryIndex];
 				cancellationToken.ThrowIfCancellationRequested();
-				using var meshStream = archive.GetEntryPayloadStream(payload.BaseStream, meshEntry.MetaData.Uid, _openedForge.Version);
-				var meshProperties = Mesh.Read(meshStream);
-				var resolvedMesh = _dependencyResolver.Resolve(meshProperties.CompiledMeshObjectUid, AssetBankKind.Mesh, cancellationToken, progress);
-				CompiledMeshObject compiledMesh;
-				using (var compiledStream = resolvedMesh.OpenStream())
+				if (!entities.MeshPlacements.TryGetValue(meshEntry.MetaData.Uid, out var placements))
+					continue;
+				TexturedSceneMesh sceneMesh;
+				try
 				{
-					var header = MeshHeader.Read(compiledStream, resolvedMesh.Version);
-					compiledMesh = CompiledMeshObject.Read(compiledStream, header);
-				}
+					using var meshStream = archive.GetEntryPayloadStream(payload, meshEntry.MetaData.Uid, forge.Version);
+					var source = resolver.ResolveMesh(meshStream, forge, meshEntry.MetaData, cancellationToken, progress);
+					var compiledMesh = source.Decode();
+					var objectCount = compiledMesh.Objects.Count / (int)Math.Max(1u, compiledMesh.MeshHeader.NumLods);
+					if (!compiledMesh.Objects.Take(objectCount).Any(part => part.Length > 0))
+						continue;
 
-				var objectCount = compiledMesh.Objects.Count / (int)Math.Max(1, compiledMesh.MeshHeader.NumLods);
-				var textures = new SceneTextureData[objectCount];
-				for (var objectIndex = 0; loadTextures && objectIndex < objectCount && objectIndex < meshProperties.Materials.Length; objectIndex++)
+					var partMaterials = new SceneMaterial[objectCount];
+					for (var objectIndex = 0; loadTextures && objectIndex < objectCount; objectIndex++)
+					{
+						cancellationToken.ThrowIfCancellationRequested();
+						partMaterials[objectIndex] = ReadSceneMaterial(materials, source.MaterialForPart(compiledMesh, objectIndex), textureCache, cancellationToken, progress, forge.Version, resolver);
+					}
+
+					var instances = entityUid.HasValue ? [Matrix4.Identity] :
+						placements.Take(4096).Select(placement => placement.Transform).ToArray();
+					sceneMesh = new TexturedSceneMesh(meshEntry.MetaData.Uid, compiledMesh, partMaterials, instances);
+				}
+				catch (Exception error) when (error is IOException or InvalidDataException or OverflowException)
 				{
-					cancellationToken.ThrowIfCancellationRequested();
-					textures[objectIndex] = TryReadDiffuseTexture(archive, payload.BaseStream, meshProperties.Materials[objectIndex], textureCache, cancellationToken, progress);
+					firstMeshError ??= new InvalidDataException($"Mesh {meshEntry.MetaData.Uid:X16} could not be loaded.", error);
+					continue;
 				}
-
-				var meshTransforms = entities.AssetTransforms.TryGetValue(meshEntry.MetaData.Uid, out var linkedTransforms)
-					&& linkedTransforms.Length > 0
-					? linkedTransforms.Take(4096).ToArray()
-					: [Matrix4.Identity];
-				var sceneMesh = new TexturedSceneMesh(meshEntry.MetaData.Uid, compiledMesh, textures, meshTransforms);
 				scene.Add(sceneMesh);
 				meshReady?.Invoke(sceneMesh, scene.Count == 1 ? entities.Lights : Array.Empty<SceneLight>());
 			}
+			if (scene.Count == 0 && firstMeshError != null)
+				throw firstMeshError;
 			return new LoadUnitSceneResult(scene, entities.Lights.ToList());
 		}
 
-		private SceneTextureData TryReadDiffuseTexture(FlatArchive archive, Stream payload, ulong materialUid,
-			Dictionary<ulong, SceneTextureData> textureCache, CancellationToken cancellationToken, Action<string> progress)
+		private SceneMaterial ReadSceneMaterial(SceneMaterialReader materials, ulong materialUid,
+			Dictionary<ulong, SceneTextureData> textureCache, CancellationToken cancellationToken, Action<string> progress, uint version, AssetDependencyResolver resolver)
 		{
-			try
+			SceneMaterialReader.Binding material;
+			try { material = materials.Read(materialUid); }
+			catch (Exception error) when (error is IOException or InvalidDataException) { return null; }
+			if (material == null)
+				return null;
+			var diffuse = ReadSceneTexture(material.Candidates(TextureType.Diffuse), materials, textureCache, cancellationToken, progress, resolver);
+			var baseColor = diffuse ?? ReadSceneTexture(material.Candidates(TextureType.Misc), materials, textureCache, cancellationToken, progress, resolver);
+			var blend = ReadSceneTexture(material.Candidates(TextureType.Diffuse, 1), materials, textureCache, cancellationToken, progress, resolver);
+			return new SceneMaterial(
+				baseColor,
+				ReadSceneTexture(material.Candidates(TextureType.Normal), materials, textureCache, cancellationToken, progress, resolver),
+				ReadSceneTexture(material.Candidates(TextureType.Specular), materials, textureCache, cancellationToken, progress, resolver),
+				material.UvScale(version))
 			{
-				var materialEntry = archive.Entries.FirstOrDefault(entry => entry.MetaData.Uid == materialUid);
-				if (materialEntry == null)
-					return null;
-				using var materialStream = archive.GetEntryPayloadStream(payload, materialUid, _openedForge.Version);
-				var material = Material.Read(materialStream);
+				Opacity = SceneMaterialReader.ResolveOpacity(material, diffuse),
+				Tint = material.Tint,
+				GlassOpacity = material.Glass ? 0.28f : null,
+				BlendDiffuse = blend,
+				BlendMask = blend == null ? null : ReadSceneTexture(
+					material.Candidates(TextureType.ColorMask).Concat(material.Candidates(TextureType.ColorMask, 1)),
+					materials, textureCache, cancellationToken, progress, resolver),
+				BlendUvScale = material.UvScale(version, 1)
+			};
+		}
 
-				foreach (var selector in material.BaseTextureMapSpecs.Where(selector => selector.TextureMapSpecUid != 0))
+		private SceneTextureData ReadSceneTexture(IEnumerable<ulong> candidates, SceneMaterialReader materials,
+			Dictionary<ulong, SceneTextureData> textureCache,
+			CancellationToken cancellationToken, Action<string> progress, AssetDependencyResolver resolver)
+		{
+			foreach (var textureUid in candidates)
+			{
+				cancellationToken.ThrowIfCancellationRequested();
+				if (textureCache.TryGetValue(textureUid, out var cached))
 				{
-					var specEntry = archive.Entries.FirstOrDefault(entry => entry.MetaData.Uid == selector.TextureMapSpecUid);
-					if (specEntry == null)
-						continue;
-					using var specStream = archive.GetEntryPayloadStream(payload, specEntry.MetaData.Uid, _openedForge.Version);
-					var spec = TextureMapSpec.Read(specStream);
-					if (spec.TextureType != (uint)TextureType.Diffuse && spec.TextureType != (uint)TextureType.Misc)
-						continue;
-
-					var mapEntry = archive.Entries.FirstOrDefault(entry => entry.MetaData.Uid == spec.TextureMapUid);
-					if (mapEntry == null)
-						continue;
-					using var mapStream = archive.GetEntryPayloadStream(payload, mapEntry.MetaData.Uid, _openedForge.Version);
-					var textureMap = TextureMap.Read(mapStream);
-					var textureUid = textureMap.TexUidMipSet2.FirstOrDefault(uid => uid != 0)
-					                 != 0
-						? textureMap.TexUidMipSet2.First(uid => uid != 0)
-						: textureMap.TexUidMipSet1.FirstOrDefault(uid => uid != 0);
-					if (textureUid == 0)
-						continue;
-					if (textureCache.TryGetValue(textureUid, out var cachedTexture))
-						return cachedTexture;
-
-					var resolvedTexture = _dependencyResolver.Resolve(textureUid, AssetBankKind.Texture, cancellationToken, progress);
-					using var textureStream = resolvedTexture.OpenStream();
-					var texture = Texture.Read(textureStream, resolvedTexture.Version);
-					using var image = Pfim.Pfim.FromStream(DdsHelper.GetDdsStream(texture, texture.ReadSurfaceBytes(textureStream)));
-					var textureData = SceneTextureData.FromPfim(textureUid, image);
-					textureCache[textureUid] = textureData;
-					return textureData;
+					if (cached != null)
+						return cached;
+					continue;
+				}
+				try
+				{
+					if (!materials.TryReadInlineTexture(textureUid, out var texture, out var surface))
+					{
+						var resolved = resolver.Resolve(textureUid, AssetBankKind.Texture, cancellationToken, progress);
+						using var stream = resolved.OpenStream();
+						texture = Texture.Read(stream, resolved.Version);
+						surface = texture.ReadSurfaceBytes(stream);
+					}
+					using var dds = DdsHelper.GetDdsStream(texture, surface);
+					using var image = Pfim.Pfim.FromStream(dds);
+					return textureCache[textureUid] = SceneTextureData.FromPfim(textureUid, image, texture.TexFormat);
+				}
+				catch (Exception error) when (error is IOException or InvalidDataException or NotSupportedException
+					or NotImplementedException or ArgumentException or KeyNotFoundException or DllNotFoundException)
+				{
+					textureCache[textureUid] = null;
 				}
 			}
-			catch (OperationCanceledException)
-			{
-				throw;
-			}
-			catch
-			{
-			}
-
 			return null;
 		}
 
-		private Matrix4[] ReadEntityTransforms(FlatArchive archive, Stream payload)
+		private CompiledMeshObject ReadMeshPreview(AssetStream assetStream)
 		{
-			var transforms = new List<Matrix4>();
-			foreach (var entity in archive.Entries.Where(entry => entry.MetaData.FileType == (uint)Magic.Entity))
+			using var stream = assetStream.StreamProvider.Invoke();
+			var asset = assetStream.MetaData;
+			if (!SceneLightingReader.IsMesh((uint)asset.Magic))
+				return CompiledMeshObject.Read(stream, MeshHeader.Read(stream, _openedForge.Version));
+
+			var metadata = FileMetaData.CreateDetected(asset.Filename, asset.ContainerType, (uint)asset.Magic, asset.Uid);
+			if (assetStream.StreamType == AssetStreamType.ForgeEntry)
 			{
-				try
-				{
-					using var stream = archive.GetEntryPayloadStream(payload, entity.MetaData.Uid, _openedForge.Version);
-					if (stream.ReadUInt32() != (uint)Magic.Entity)
-						continue;
-					stream.ReadByte();
-					var m11 = stream.ReadSingle(); var m21 = stream.ReadSingle(); var m31 = stream.ReadSingle(); var m41 = stream.ReadSingle();
-					var m12 = stream.ReadSingle(); var m22 = stream.ReadSingle(); var m32 = stream.ReadSingle(); var m42 = stream.ReadSingle();
-					var m13 = stream.ReadSingle(); var m23 = stream.ReadSingle(); var m33 = stream.ReadSingle(); var m43 = stream.ReadSingle();
-					var m14 = stream.ReadSingle(); var m24 = stream.ReadSingle(); var m34 = stream.ReadSingle(); var m44 = stream.ReadSingle();
-					transforms.Add(new Matrix4(m11, m21, m31, m41, m12, m22, m32, m42, m13, m23, m33, m43, m14, m24, m34, m44));
-				}
-				catch
-				{
-				}
+				var start = stream.BaseStream.Position;
+				var hasBodyMagic = stream.ReadUInt32() == (uint)asset.Magic;
+				stream.BaseStream.Position = start;
+				if (!hasBodyMagic)
+					metadata = FileMetaData.Read(stream, _openedForge.Version);
 			}
-			return transforms.Count > 0 ? transforms.ToArray() : [Matrix4.Identity];
+			return _dependencyResolver.ResolveMesh(stream, _openedForge, metadata, CancellationToken.None).Decode();
 		}
 
 		private void PreviewAsset(AssetStream assetStream)
 		{
 			switch (MagicHelper.GetFiletype(assetStream.MetaData.Magic))
 			{
-				case AssetType.Mesh:
+				case var _ when (Magic)assetStream.MetaData.Magic is Magic.Entity or Magic.EntityY11S3:
 				{
-					using var stream = assetStream.StreamProvider.Invoke();
-					var header = MeshHeader.Read(stream, _openedForge.Version);
-					var mesh = CompiledMeshObject.Read(stream, header);
+					var scene = ReadEntityPreview(assetStream);
+					if (scene.Count == 0)
+					{
+						_infoControl.SetObjects(new List<TreeListViewEntry>
+						{
+							CreateMetadataInfoNode(assetStream),
+							new("3D preview", "No renderable mesh references found in this archive.")
+						});
+						_infoControl.ExpandAll();
+						SetPreviewPanel(_infoControl);
+						break;
+					}
+					SetPreviewPanel(_glControl);
+					using (_glControl.SuspendPainting())
+					{
+						_glControl.MakeCurrent();
+						_renderer3d.BuildTexturedScene(scene);
+						_renderer3d.SetPartBounds([]);
+						_renderer3d.ResetView();
+					}
+					break;
+				}
+				case AssetType.Mesh:
+				case var _ when SceneLightingReader.IsMesh((uint)assetStream.MetaData.Magic):
+				{
+					var mesh = ReadMeshPreview(assetStream);
+					if (mesh.MeshHeader.NumLods == 0 ||
+					    !mesh.Objects.Take(mesh.Objects.Count / (int)mesh.MeshHeader.NumLods).Any(part => part.Length > 0))
+						throw new InvalidDataException("This mesh has no renderable geometry in its highest detail level.");
 
 					OnUiThread(() =>
 					{
 						SetPreviewPanel(_glControl);
 						using (_glControl.SuspendPainting())
 						{
+							_glControl.MakeCurrent();
 							_renderer3d.BuildModelQuads(mesh);
 							_renderer3d.SetTexture(null);
-							_renderer3d.SetPartBounds(header.ObjectBoundingBoxes.Take((int)(header.ObjectBoundingBoxes.Length / header.NumLods)).ToArray());
+							_renderer3d.SetPartBounds(mesh.MeshHeader.ObjectBoundingBoxes);
 						}
 					});
 
@@ -497,21 +537,7 @@ namespace Prism
 				}
 				case AssetType.Sound:
 				{
-					using var stream = assetStream.StreamProvider.Invoke();
-					var sound = WemSound.Read(stream, _openedForge.Version);
-
-					var entries = new List<TreeListViewEntry>
-					{
-						CreateMetadataInfoNode(assetStream)
-					};
-
-					OnUiThread(() =>
-					{
-						_infoControl.SetObjects(entries);
-						_infoControl.ExpandAll();
-						SetPreviewPanel(_infoControl);
-					});
-
+					PreviewSoundMedia(assetStream);
 					break;
 				}
 				case AssetType.Texture:
@@ -568,25 +594,6 @@ namespace Prism
 
 					switch ((Magic)assetStream.MetaData.Magic)
 					{
-						case Magic.Mesh:
-						{
-							using var stream = assetStream.StreamProvider.Invoke();
-							var mp = Mesh.Read(stream);
-
-							entries = new List<TreeListViewEntry>
-							{
-								CreateMetadataInfoNode(assetStream),
-								new(nameof(Mesh), null,
-									new TreeListViewEntry("Var1", mp.Var1),
-									new TreeListViewEntry("Var2", mp.Var2),
-									new TreeListViewEntry("Mesh UID", $"{mp.CompiledMeshObjectUid:X16}"),
-									new TreeListViewEntry(nameof(Mesh.Bones), null,
-										mp.Bones.Select(arg => new TreeListViewEntry("ID", $"{(Enum.IsDefined(typeof(BoneId), arg.Id) ? arg.Id : $"{(uint)arg.Id:X8}")}")).ToArray()),
-									new TreeListViewEntry(nameof(Mesh.Materials), null, mp.Materials.Select(arg => new TreeListViewEntry("UID", $"{arg:X16}")).ToArray())
-								)
-							};
-							break;
-						}
 						case Magic.ShaderCodeModuleUserMaterial:
 						case Magic.ShaderCodeModulePostPro:
 						{
@@ -603,7 +610,7 @@ namespace Prism
 						case Magic.Material:
 						{
 							using var stream = assetStream.StreamProvider.Invoke();
-							var mc = Material.Read(stream);
+							var mc = Material.Read(stream, _openedForge.Version);
 
 							entries = new List<TreeListViewEntry>
 							{
@@ -634,7 +641,7 @@ namespace Prism
 						case Magic.TextureMap:
 						{
 							using var stream = assetStream.StreamProvider.Invoke();
-							var mc = TextureMap.Read(stream);
+							var mc = TextureMap.Read(stream, _openedForge.Version);
 
 							entries = new List<TreeListViewEntry>
 							{
@@ -691,6 +698,19 @@ namespace Prism
 			}
 		}
 
+		private List<TexturedSceneMesh> ReadEntityPreview(AssetStream asset)
+		{
+			if (asset.StreamType != AssetStreamType.ArchiveEntry ||
+			    asset.ParentUid is not { } parentUid ||
+			    _openedForge.GetContainer(parentUid) is not ForgeAsset container)
+				return [];
+
+			using var payload = container.GetDataStream(_openedForge);
+			var archive = FlatArchive.Read(_openedForge, container, payload);
+			return BuildArchiveScene(archive, payload.BaseStream, new Dictionary<ulong, SceneTextureData>(),
+				CancellationToken.None, null, null, loadTextures: true, _openedForge, _dependencyResolver, entityUid: asset.MetaData.Uid).Meshes;
+		}
+
 		private static TreeListViewEntry CreateUidLinkEntryNode(UidLinkEntry ule)
 		{
 			var node1 = new TreeListViewEntry(nameof(UidLinkEntry.UidLinkNode1), ule.UidLinkNode1 == null ? "null" : $"{ule.UidLinkNode1.LinkedUid:X16}");
@@ -718,17 +738,49 @@ namespace Prism
 			);
 		}
 
-		private void OpenForge(string filename)
+		private static bool IsForgeFile(string path) =>
+			string.Equals(Path.GetExtension(path), ".forge", StringComparison.OrdinalIgnoreCase) && File.Exists(path);
+
+		private void SelectForgeFiles(string[] filenames)
 		{
-			OpenedForge = Forge.GetForge(filename);
-			Text = $"Prism - {filename}";
+			_previewCancellation?.Cancel();
+			ResetAudioPreview();
+			var failures = new List<string>();
+			foreach (var filename in filenames.Where(IsForgeFile).Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase))
+			{
+				if (_loadedForges.Keys.Any(forge => string.Equals(forge.SourcePath, filename, StringComparison.OrdinalIgnoreCase)))
+					continue;
+				try
+				{
+					var forge = Forge.GetForge(filename);
+					_loadedForges.Add(forge, new AssetDependencyResolver(forge.SourcePath));
+				}
+				catch (Exception error)
+				{
+					failures.Add($"{Path.GetFileName(filename)}: {error.Message}");
+				}
+			}
+			if (_loadedForges.Count > 0)
+			{
+				ActivateForge(_loadedForges.Keys.First());
+				_assetList.SetForges(_loadedForges.Keys);
+				_assetList.SelectFirstNode();
+				Text = $"Prism - {_loadedForges.Count:N0} Forge file(s)";
+				_statusForgeInfo.Text = $"{_loadedForges.Keys.Sum(forge => (long)forge.Entries.Length):N0} entries";
+			}
+			if (failures.Count > 0)
+				MessageBox.Show(this, string.Join(Environment.NewLine, failures), "Open Forge", MessageBoxButtons.OK, MessageBoxIcon.Error);
 		}
 
 		protected override void OnFormClosed(FormClosedEventArgs e)
 		{
+			ResetAudioPreview();
 			_previewCancellation?.Cancel();
-			_dependencyResolver?.Dispose();
-			_openedForge?.Stream.Dispose();
+			foreach (var (forge, resolver) in _loadedForges)
+			{
+				resolver.Dispose();
+				forge.Stream.Dispose();
+			}
 			base.OnFormClosed(e);
 		}
 

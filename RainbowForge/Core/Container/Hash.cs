@@ -16,6 +16,33 @@ namespace RainbowForge.Core.Container
 			Name = name;
 		}
 
+		internal static Hash ReadLegacyFastLoad(BinaryReader r, Entry entry)
+		{
+			if (entry.Size is not (20 or 112) || entry.End > r.BaseStream.Length)
+				throw new InvalidDataException("Unexpected legacy fast-load record size.");
+			var hash = r.ReadUInt64();
+			if (r.ReadUInt32() != 0 || r.ReadUInt32() != (entry.Size == 20 ? 0U : 1U))
+				throw new InvalidDataException("Unexpected legacy fast-load record flags.");
+			if (entry.Size == 20)
+				return new Hash(hash);
+
+			var name = Encoding.ASCII.GetString(r.ReadBytes(64)).TrimEnd('\0');
+			return new Hash(hash, name: name);
+		}
+
+		internal static Hash ReadAprilFastLoad(BinaryReader r, Entry entry)
+		{
+			if (entry.Size < 20 || entry.End > r.BaseStream.Length)
+				throw new InvalidDataException("Truncated April Alpha fast-load record.");
+			var hash = r.ReadUInt64();
+			var nameFlag = r.ReadUInt32();
+			if (nameFlag == 0)
+				return new Hash(hash);
+			if (nameFlag != 1 || entry.Size < 80)
+				throw new InvalidDataException("Invalid April Alpha fast-load name.");
+			return new Hash(hash, name: Encoding.ASCII.GetString(r.ReadBytes(64)).TrimEnd('\0'));
+		}
+
 		public static Hash Read(BinaryReader r)
 		{
 			var hash1 = r.ReadUInt64(); // [0x0]

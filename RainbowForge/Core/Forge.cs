@@ -1,5 +1,6 @@
-﻿using RainbowForge.Core.Container;
+using RainbowForge.Core.Container;
 using System;
+using RainbowForge.Core.DataBlock;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -38,7 +39,7 @@ namespace RainbowForge.Core
 				_uidToEntryIndexMap[entries[i].Uid] = i;
 		}
 
-		public static Forge Read(BinaryReader r, List<long> entryStarts)
+		public static Forge Read(BinaryReader r, List<long> entryStarts = null)
 		{
 			/*
 				"scimitar"
@@ -96,6 +97,11 @@ namespace RainbowForge.Core
 
 			var x19 = r.ReadUInt32(); // [0x19] = 0
 			var x1d = r.ReadByte(); // literally no correlation found to any data so far
+            if (version == 29 && fatLocation > r.BaseStream.Position)
+            {
+                CheckRange(r.BaseStream, fatLocation, 44);
+                r.BaseStream.Position = fatLocation;
+            }
             if (version >= 34)
             {
                 var unk4 = r.ReadUInt32();
@@ -119,12 +125,14 @@ namespace RainbowForge.Core
 				var sizeOfFat = r.ReadUInt32();
 				var numTables = r.ReadUInt32();
 
-				var firstTablePosition = r.ReadUInt64();
-
-
-				r.BaseStream.Seek((long)firstTablePosition, SeekOrigin.Begin);
+				var tablePosition = r.ReadInt64();
+				var visitedTables = new HashSet<long>();
 				for (var i = 0; i < numTables; i++)
 				{
+					if (!visitedTables.Add(tablePosition))
+						throw new InvalidDataException("Cyclic Forge allocation table chain.");
+					CheckRange(r.BaseStream, tablePosition, 48);
+					r.BaseStream.Position = tablePosition;
 					var maxFile = r.ReadInt32();
 
 					var maxDir = r.ReadInt32();
@@ -135,6 +143,8 @@ namespace RainbowForge.Core
 					var metaTableOffset = r.ReadInt64();
 					var directoryOffset = r.ReadInt64();
 
+					CheckRange(r.BaseStream, posFat, maxFile * 20L);
+					CheckRange(r.BaseStream, metaTableOffset, maxFile * 320L);
 					r.BaseStream.Seek(posFat, SeekOrigin.Begin);
 					var entries = new Entry[maxFile];
 					for (var j = 0; j < maxFile; j++)
@@ -146,39 +156,41 @@ namespace RainbowForge.Core
 
 					totalEntries.AddRange(entries);
 
-					if (nextPosFat != -1)
-						r.BaseStream.Seek(nextPosFat, SeekOrigin.Begin);
-					if (version >= 27)
-					{
-						var unk5 = r.ReadUInt32();
-					}
+					if (nextPosFat == -1)
+						break;
+					tablePosition = nextPosFat;
 				}
             }
             if (version >= 34)
             {
-                totalEntries = GetEntries(r, entryStarts);
+                totalEntries = version == 34 ? Y11S2AllocationTable.TryRead(r) : null;
+                if (totalEntries == null)
+                {
+                    entryStarts ??= GetEntryStarts(r);
+                    // Soundmedia banks can contain raw page-aligned RIFF/WEM files.
+                    totalEntries = entryStarts.Count > 0 ? GetEntries(r, entryStarts, useResourceUids: version >= 34) : GetRawRiffEntries(r);
+                }
             }
             // TODO: organize Forge into tables instead of one big entry list
             return new Forge(version, fatLocation, numEntries, totalEntries.ToArray(), r);
 		}
 
+		private static void CheckRange(Stream stream, long offset, long size)
+		{
+			if (offset < 0 || size < 0 || offset > stream.Length || size > stream.Length - offset)
+				throw new InvalidDataException("Forge allocation table extends beyond the archive.");
+		}
+
 		public static List<long> GetEntryStarts(BinaryReader r)
 		{
             List<long> entryStarts = new List<long>();
-            long maxEntryStart = r.BaseStream.Length / 0x1000;
-
-			for (long index = 0x1000; index < maxEntryStart * 0x1000; index += 0x1000)
+			for (long index = 0x1000; index + 19 <= r.BaseStream.Length; index += 0x1000)
 			{
 				r.BaseStream.Seek(index, SeekOrigin.Begin);
-
-                ulong[] buffer = new ulong[0x3];
-				for (var i = 0; i <= 2; i++)
-				{
-					buffer[i] = r.ReadUInt64();
-				}
-				if (buffer[0x00] == 0x1015fa9957fbaa37 &&
-					buffer[0x01] == 0x01800400000f0003 &&
-					buffer[0x02] == 0x2000000020000000)
+				// Y11S3+: only the magic and the low 7 bytes of the second qword are stable; its top byte (0x01, 0x04, 0x09)
+				// and the whole third qword vary per entry
+				if (r.ReadUInt64() == 0x1015fa9957fbaa37 &&
+					(r.ReadUInt64() & 0x00FFFFFFFFFFFFFF) == 0x00800400000f0003)
 				{
 					entryStarts.Add(index);
 				}
@@ -186,54 +198,97 @@ namespace RainbowForge.Core
 			return entryStarts;
         }
 
-        public static List<Entry> GetEntries(BinaryReader r, List<long> entryStarts)
+        public static List<Entry> GetEntries(BinaryReader r, List<long> entryStarts, bool useResourceUids = false)
 		{
-            var buffer = new byte[0x18];
-            long lastNonZeroByteIndex = r.BaseStream.Position;
-            long index = r.BaseStream.Position;
-
-            List<Entry> entries = new List<Entry>();
-            long start;
-			long end;
-            uint size;
-
-			long[] entryStartsArray = entryStarts.ToArray();
-            for (var i = 0; i < entryStartsArray.Length; i++)
+			var entries = new List<Entry>(entryStarts.Count);
+			var resourceUids = new ulong[entryStarts.Count];
+			for (var i = 0; i < entryStarts.Count; i++)
 			{
-                start = entryStartsArray[i];
-
-				long startSearch = (i < entryStartsArray.Length - 1) ? entryStartsArray[i + 1] - 0x1000 : entryStartsArray[i];
-                long endSearch = (i < entryStartsArray.Length - 1) ? entryStartsArray[i + 1] : r.BaseStream.Length;
-
-                r.BaseStream.Seek(startSearch, SeekOrigin.Begin);
-				while(r.BaseStream.Position < endSearch)
+				var start = entryStarts[i];
+				var limit = i + 1 < entryStarts.Count ? entryStarts[i + 1] : r.BaseStream.Length;
+				var end = limit;
+				var exact = false;
+				try
 				{
-                    byte newByte = r.ReadByte();
-                    if (newByte != 0x00)
-                    {
-                        lastNonZeroByteIndex = r.BaseStream.Position;
-                    }
-                }
-                end = lastNonZeroByteIndex;
-                size = (uint)(lastNonZeroByteIndex - start);
-                entries.Add(new Entry((ulong)i, start, size, end));
-            }
-
-            return entries;
+					r.BaseStream.Position = start;
+					var metadata = ChunkedDataBlock.TryReadVerifiedEnvelope(r, limit, out _);
+					if (metadata != null && ChunkedDataBlock.TryReadVerifiedEnvelope(r, limit, out _) != null)
+					{
+						end = r.BaseStream.Position;
+						exact = true;
+						if (useResourceUids && metadata.UnpackedLength >= 16)
+						{
+							using var directory = new BinaryReader(metadata.GetDataPrefixStream(r, 16));
+							var count = directory.ReadUInt32();
+							if (count > 0 && 4L + 12L * count <= metadata.UnpackedLength)
+								resourceUids[i] = directory.ReadUInt64();
+						}
+					}
+				}
+				catch (Exception error) when (error is IOException or InvalidDataException or OverflowException or NotSupportedException or DllNotFoundException or EntryPointNotFoundException)
+				{
+					// Keep the page address available for diagnostics and legacy decoding.
+				}
+				entries.Add(new Entry((ulong)i, start, checked((uint)(end - start)), end) { HasExactChunkBounds = exact });
+			}
+			if (useResourceUids)
+			{
+				// Reserve unique resource IDs before retaining any fallback slot numbers.
+				var counts = resourceUids.Where(uid => uid != 0).GroupBy(uid => uid)
+					.ToDictionary(group => group.Key, group => group.Count());
+				var assigned = counts.Where(pair => pair.Value == 1).Select(pair => pair.Key).ToHashSet();
+				for (var i = 0; i < entries.Count; i++)
+				{
+					var uid = resourceUids[i];
+					if (uid == 0 || counts[uid] != 1)
+					{
+						uid = (ulong)i;
+						while (!assigned.Add(uid))
+							uid += (ulong)entries.Count;
+					}
+					var entry = entries[i];
+					entries[i] = new Entry(uid, entry.Offset, entry.Size, entry.End)
+					{
+						HasExactChunkBounds = entry.HasExactChunkBounds
+					};
+				}
+			}
+			return entries;
         }
+
+        public static List<Entry> GetRawRiffEntries(BinaryReader r)
+		{
+			var entries = new List<Entry>();
+			var length = r.BaseStream.Length;
+
+			for (long index = 0x1000; index + 8 <= length; index += 0x1000)
+			{
+				if (!RawRiffAsset.TryReadHeader(r, index, length, out var riff))
+					continue;
+
+				entries.Add(new Entry((ulong)entries.Count, riff.Offset, (uint)riff.Length, riff.Offset + riff.Length));
+				index = (riff.Offset + riff.Length - 1) & ~0xFFFL;
+			}
+
+			return entries;
+		}
 
         public static Forge GetForge(string filename)
 		{
 			FileSystemUtil.AssertFileExists(filename);
 
 			var forgeStream = new BinaryReader(File.Open(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
-			forgeStream.BaseStream.Seek(9, SeekOrigin.Begin);
-			var version = forgeStream.ReadUInt32();
-			List<long> entryStarts = version >= 34 ? GetEntryStarts(forgeStream) : new List<long>();
-			forgeStream.BaseStream.Seek(0, SeekOrigin.Begin);
-			var forge = Read(forgeStream, entryStarts);
-			forge.SourcePath = Path.GetFullPath(filename);
-			return forge;
+			try
+			{
+				var forge = Read(forgeStream);
+				forge.SourcePath = Path.GetFullPath(filename);
+				return forge;
+			}
+			catch
+			{
+				forgeStream.Dispose();
+				throw;
+			}
 		}
 
 		public ForgeContainer GetContainer(ulong entryUid)
@@ -272,11 +327,23 @@ namespace RainbowForge.Core
 						return Descriptor.Read(Stream, entry);
 					case ContainerMagic.Hash:
 						return Hash.Read(Stream);
+					case ContainerMagic.LegacyFastLoad when Version == 29 && entry.Uid == 0xbf0:
+						return Hash.ReadLegacyFastLoad(Stream, entry);
+					case ContainerMagic.AprilAlphaFastLoad when Version == 29 && entry.Uid == 0xbf0:
+						return Hash.ReadAprilFastLoad(Stream, entry);
+					case ContainerMagic.LegacyStreamingDirectory when Version == 29 && entry.Uid == 0x51:
+						return new ForgeContainer();
+					case ContainerMagic.FileLzo:
+						return ForgeAsset.Read(Stream, entry, requireVerifiedEnvelope: true);
 					case ContainerMagic.File:
 					case ContainerMagic.File2:
 					case ContainerMagic.File3:
 						return ForgeAsset.Read(Stream, entry);
+					case (ContainerMagic)RawRiffAsset.RiffMagic:
+						return RawRiffAsset.Read(entry);
 					default:
+						if (RawRiffAsset.TryReadHeader(Stream, start, Math.Min(end, Stream.BaseStream.Length), out var riff))
+							return riff;
 						throw new InvalidDataException($"No constructor for container {i} of style 0x{containerMagic:X} (from 0x{start:X} to 0x{end:X}), skipping");
 				}
 			}

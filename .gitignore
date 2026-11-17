@@ -6,3 +6,4 @@ riderModule.iml
 private/
 .vs/
 .vscode/
+/target/

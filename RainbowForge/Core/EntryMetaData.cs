@@ -102,8 +102,19 @@ namespace RainbowForge.Core
 					var x138 = r.ReadUInt32();
 					var x13c = r.ReadUInt32();
 
-					var nameBytes = NameEncoding.DecodeName(name[..nameLength], fileType, uid, offset, NameEncoding.FILENAME_ENCODING_ENTRY_KEY_STEP);
-					return new EntryMetaData(Encoding.ASCII.GetString(nameBytes), timestamp, prevEntryIdx, nextEntryIdx, fileType, dataSize, x0c, x24, x04, x12c);
+					string fileName;
+					if (version == 29 && nameLength == 0)
+					{
+						// Early v29 Forges store a plain, NUL-terminated name in the fixed field.
+						var terminator = Array.IndexOf(name, (byte)0);
+						fileName = Encoding.ASCII.GetString(name, 0, terminator < 0 ? name.Length : terminator);
+					}
+					else
+					{
+						var nameBytes = NameEncoding.DecodeName(name[..nameLength], fileType, uid, offset, NameEncoding.FILENAME_ENCODING_ENTRY_KEY_STEP);
+						fileName = Encoding.ASCII.GetString(nameBytes);
+					}
+					return new EntryMetaData(fileName, timestamp, prevEntryIdx, nextEntryIdx, fileType, dataSize, x0c, x24, x04, x12c);
 				}
 				default:
 					throw new NotImplementedException($"Unsupported version {version}");

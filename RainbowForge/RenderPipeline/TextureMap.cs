@@ -25,10 +25,32 @@ namespace RainbowForge.RenderPipeline
 			Data2 = data2;
 		}
 
-		public static TextureMap Read(BinaryReader r)
+		public static TextureMap Read(BinaryReader r, uint version = 33)
 		{
+			var start = r.BaseStream.Position;
 			var magic = r.ReadUInt32();
 			MagicHelper.AssertEquals(Magic.TextureMap, magic);
+
+			// August Closed Alpha stores five compiled mip UIDs after its resource path.
+			if (version == 29 && r.BaseStream.Length - start >= 170)
+			{
+				r.BaseStream.Position = start + 108;
+				var pathLength = r.ReadUInt32();
+				if (pathLength > 0 && r.BaseStream.Length - start == 170L + pathLength &&
+				    r.ReadByte() == '/')
+				{
+					var mips = ReadMipUids(r, r.BaseStream.Length - 41);
+					return new TextureMap(0, 0, 0, 0, [], [], mips, []);
+				}
+				r.BaseStream.Position = start + sizeof(uint);
+			}
+
+			if (version == 29 && r.BaseStream.Length - start == 157)
+			{
+				var first = ReadMipUids(r, start + 8);
+				var second = ReadMipUids(r, start + 116);
+				return new TextureMap(0, 0, 0, 0, [], first, second, []);
+			}
 
 			var var1 = r.ReadUInt32();
 			var var2 = r.ReadUInt32();
@@ -48,6 +70,15 @@ namespace RainbowForge.RenderPipeline
 			var data2 = r.ReadBytes(32);
 
 			return new TextureMap(var1, var2, var3, var4, data, texUidMipSet1, texUidMipSet2, data2);
+		}
+
+		private static ulong[] ReadMipUids(BinaryReader reader, long offset)
+		{
+			reader.BaseStream.Position = offset;
+			var uids = new ulong[5];
+			for (var i = 0; i < uids.Length; i++)
+				uids[i] = reader.ReadUInt64();
+			return uids;
 		}
 	}
 }

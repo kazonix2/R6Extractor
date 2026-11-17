@@ -22,6 +22,7 @@ namespace RainbowForge.Model
 		public uint FaceDataLen { get; }
 		public uint UnknownBlock1Len { get; }
 		public uint FaceUnknownDataLen { get; }
+		internal bool HasLegacyLayout { get; private init; }
 
 		public MeshHeader(FileMetaData metaData, uint revision, int meshType, uint numVerts, uint vertLen, uint numLods, MeshObjectHeader[] objectHeaders, BoundingBox[] objectBoundingBoxes,
 			MeshObjectSkinMapping[] objectSkinMappings, long vertBlockOffset, long trisBlockStart, uint vertsDataLen, uint vertmapsDataLen, long extraDataStart, uint faceDataLen,
@@ -55,12 +56,49 @@ namespace RainbowForge.Model
 			var var2 = r.ReadUInt32();
 			var var3 = r.ReadUInt32();
 
+			return ReadCompiled(r, version, metaHeader, embedded: false, out _);
+		}
+
+		/// <summary>Reads an April Alpha Mesh resource at its body, after the file metadata.</summary>
+		public static bool TryReadEmbedded(BinaryReader r, uint version, FileMetaData metadata,
+			out MeshHeader header, out long compiledEnd)
+		{
+			header = null;
+			compiledEnd = 0;
+			var stream = r.BaseStream;
+			var start = stream.Position;
+			const int compiledOffset = 29;
+			if (version != 29 || metadata.FileType != (uint)Magic.Mesh || stream.Length - start < compiledOffset + 8)
+				return false;
+
+			if (r.ReadUInt32() != (uint)Magic.Mesh)
+			{
+				stream.Position = start;
+				return false;
+			}
+			stream.Position = start + compiledOffset;
+			if (r.ReadUInt32() != (uint)Magic.CompiledMesh)
+			{
+				stream.Position = start;
+				return false;
+			}
+			stream.Position = start + compiledOffset;
+			header = ReadCompiled(r, version, metadata, embedded: true, out compiledEnd);
+			return true;
+		}
+
+		private static MeshHeader ReadCompiled(BinaryReader r, uint version, FileMetaData metaHeader, bool embedded, out long compiledEnd)
+		{
 			// model header
 			var innerModelStructMagic = r.ReadUInt32(); // [-0x8], inner model struct type
 			MagicHelper.AssertEquals(Magic.CompiledMesh, innerModelStructMagic);
 
 			var sizeUntilFooter = r.ReadUInt32(); // [-0x4]
 			var dataStart = r.BaseStream.Position; // inner model zero byte
+			compiledEnd = dataStart + sizeUntilFooter;
+			var dataEnd = embedded ? compiledEnd : r.BaseStream.Length;
+			if (dataEnd > r.BaseStream.Length)
+				throw new InvalidDataException("Embedded mesh extends beyond its resource.");
 
 			var x00 = r.ReadUInt32(); // [0x0] = 0x14
 			var revision = r.ReadUInt32(); // [0x4] = 0, 1, 2
@@ -88,19 +126,13 @@ namespace RainbowForge.Model
 			var x28 = r.ReadUInt32(); // [0x28] = 0
 			var x2C = r.ReadUInt32(); // [0x2C] = 1(animated/interactive?),
 
-			var numLods = r.ReadUInt32(); // 2(map props?), 8(some bosses, some hands), 9, 10(some weapons)
-
-			var meshType = r.ReadInt32(); // flags?.. = -1(bboxes???), 2 (assets?), 269 (weapons/gadgets)
-			var numIslands = r.ReadUInt32(); // [0x38]
-
-			var x3C = r.ReadUInt32(); // [0x3C] = 0
-			var x40 = r.ReadSingle(); // float
-			var x44 = r.ReadSingle(); // float
-
-			// EXAMINE
-			var rng3Len = r.ReadUInt32(); // [0x48] len from vertblock till valuable
-
-			// data end (till end of floats section)
+			var legacyLayout = version == 29 && x00 == 19;
+			if (legacyLayout)
+				r.BaseStream.Position = dataStart + 0x38;
+			var numLods = r.ReadUInt32();
+			var meshType = r.ReadInt32();
+			var numIslands = r.ReadUInt32();
+			r.BaseStream.Position = dataStart + (legacyLayout ? 0x58 : 0x4C);
 
 			var numVerts = vertsDataLen / vertLen;
 			var vertBlockOffset = r.BaseStream.Position;
@@ -109,22 +141,26 @@ namespace RainbowForge.Model
 
 			var tailOffset = extraDataOffset + vertmapsDataLen + unknownBlock1Len + faceStatDataLen + faceUnknownDataLen;
 
+			var partCount = (ulong)numIslands * numLods;
+			if (numLods == 0 || tailOffset > dataEnd ||
+			    partCount > (ulong)(dataEnd - tailOffset) / 36)
+				throw new InvalidDataException("Invalid mesh LOD or part table.");
 			r.BaseStream.Seek(tailOffset, SeekOrigin.Begin);
 
-			var islandMetas = new MeshObjectHeader[numIslands * numLods];
+			var islandMetas = new MeshObjectHeader[partCount];
 			for (var i = 0; i < islandMetas.Length; i++)
 				islandMetas[i] = MeshObjectHeader.Read(r);
 
-			var islandBboxes = new BoundingBox[numIslands];
+			var islandBboxes = new BoundingBox[legacyLayout && revision == 0 ? 0 : numIslands];
 			for (var i = 0; i < islandBboxes.Length; i++)
-				islandBboxes[i] = BoundingBox.Read(r);
+				islandBboxes[i] = legacyLayout ? BoundingBox.ReadLegacy(r) : BoundingBox.Read(r);
 
-			var islandSkinMapping = new MeshObjectSkinMapping[numIslands];
+			var islandSkinMapping = legacyLayout ? System.Array.Empty<MeshObjectSkinMapping>() : new MeshObjectSkinMapping[numIslands];
 			for (var i = 0; i < islandSkinMapping.Length; i++)
 				islandSkinMapping[i] = MeshObjectSkinMapping.Read(r);
 
 			return new MeshHeader(metaHeader, revision, meshType, numVerts, vertLen, numLods, islandMetas, islandBboxes, islandSkinMapping, vertBlockOffset, trisBlockOffset, vertsDataLen,
-				vertmapsDataLen, extraDataOffset, faceDataLen, unknownBlock1Len, faceUnknownDataLen);
+				vertmapsDataLen, extraDataOffset, faceDataLen, unknownBlock1Len, faceUnknownDataLen) { HasLegacyLayout = legacyLayout };
 		}
 
 		private static bool IsKnownVertexLength(uint vertLen)

@@ -32,10 +32,12 @@ namespace RainbowForge.Core.DataBlock
 			Offset = r.BaseStream.Position;
 		}
 
-		public static ChunkedData Read(BinaryReader r)
+		public static ChunkedData Read(BinaryReader r) => Read(r, shortSizes: false);
+
+		internal static ChunkedData Read(BinaryReader r, bool shortSizes)
 		{
-			var unpacked = r.ReadUInt32();
-			var packed = r.ReadUInt32();
+			var unpacked = shortSizes ? r.ReadUInt16() : r.ReadUInt32();
+			var packed = shortSizes ? r.ReadUInt16() : r.ReadUInt32();
 
 			return new ChunkedData(unpacked, packed);
 		}

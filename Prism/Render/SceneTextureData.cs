@@ -9,20 +9,38 @@ namespace Prism.Render;
 /// </summary>
 public sealed class SceneTextureData
 {
+	public enum AlphaMode { Opaque, Cutout, Blend }
 	public ulong Uid { get; }
 	public int Width { get; }
 	public int Height { get; }
+	public uint Format { get; }
 	public byte[] BgraPixels { get; }
+	public AlphaMode Alpha { get; }
 
-	private SceneTextureData(ulong uid, int width, int height, byte[] bgraPixels)
+	private SceneTextureData(ulong uid, int width, int height, byte[] bgraPixels, uint format)
 	{
 		Uid = uid;
 		Width = width;
 		Height = height;
+		Format = format;
 		BgraPixels = bgraPixels;
+		Alpha = ClassifyAlpha(bgraPixels);
 	}
 
-	public static SceneTextureData FromPfim(ulong uid, IImage image)
+	internal static AlphaMode ClassifyAlpha(byte[] pixels)
+	{
+		var mode = AlphaMode.Opaque;
+		for (var i = 3; i < pixels.Length; i += 4)
+		{
+			if (pixels[i] is > 0 and < 255)
+				return AlphaMode.Blend;
+			if (pixels[i] == 0)
+				mode = AlphaMode.Cutout;
+		}
+		return mode;
+	}
+
+	public static SceneTextureData FromPfim(ulong uid, IImage image, uint format = uint.MaxValue)
 	{
 		if (image.Width <= 0 || image.Height <= 0)
 			throw new ArgumentOutOfRangeException(nameof(image), "Texture dimensions must be positive.");
@@ -77,7 +95,7 @@ public sealed class SceneTextureData
 				}
 			}
 		}
-		return new SceneTextureData(uid, image.Width, image.Height, result);
+		return new SceneTextureData(uid, image.Width, image.Height, result, format);
 	}
 
 	private static void Write16(IImage image, int sourceRow, int x, int destination, byte[] result,

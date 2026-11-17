@@ -6,7 +6,7 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\RainbowForge\RainbowForge.csproj" />
+      <ProjectReference Include="..\RainbowScimitar\RainbowScimitar.csproj" />
     </ItemGroup>
 
     <ItemGroup>

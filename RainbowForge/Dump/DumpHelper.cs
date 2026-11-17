@@ -19,92 +19,114 @@ namespace RainbowForge.Dump
 		public static void Dump(Forge forge, Entry entry, string outputDirectory)
 		{
 			var container = forge.GetContainer(entry.Uid);
+			if (container is RawRiffAsset rawRiff)
+			{
+				DumpBin(outputDirectory, $"id{entry.Uid}", rawRiff.GetDataStream(forge).BaseStream, ext: "wem");
+				return;
+			}
+
 			if (container is not ForgeAsset forgeAsset) throw new InvalidDataException("Container is not asset");
 
 			var assetStream = forgeAsset.GetDataStream(forge);
 
-			if (entry.MetaData != null)
-			{
-                // version < 34
-				var magic = AssetTypeDetector.DetectAssetType(forge, entry);
+			// v34+ forges have no FAT metadata; the type comes from the payload's embedded FileMetaData instead
+			var fileType = AssetTypeDetector.DetectMagic(forge, entry);
+			var magic = AssetTypeDetector.DetectAssetType(forge, entry);
 
-                switch (magic)
-                {
-                    case AssetType.Mesh:
+            switch (magic)
+            {
+                case AssetType.Mesh:
+                    {
+                        var header = MeshHeader.Read(assetStream, forge.Version);
+
+                        var mesh = CompiledMeshObject.Read(assetStream, header);
+
+                        DumpMeshObj(outputDirectory, $"id{entry.Uid}_type{header.MeshType}_v{header.Revision}", mesh);
+
+                        break;
+                    }
+                case AssetType.Texture:
+                    {
+                        var texture = Texture.Read(assetStream, forge.Version);
+                        // Filter only usefull textures
+                        if (texture.TexType == TextureType.Diffuse || texture.TexType == TextureType.Misc)
                         {
-                            var header = MeshHeader.Read(assetStream, forge.Version);
+                            var surface = texture.ReadSurfaceBytes(assetStream);
 
-                            var mesh = CompiledMeshObject.Read(assetStream, header);
-
-                            DumpMeshObj(outputDirectory, $"id{entry.Uid}_type{header.MeshType}_v{header.Revision}", mesh);
-
-                            break;
+                            DumpTexture(outputDirectory, $"{texture.TexType}_{entry.Uid}", texture, surface);
                         }
-                    case AssetType.Texture:
+
+                        break;
+                    }
+                case AssetType.Sound:
+                    {
+                        // format notes: see https://github.com/vgmstream/vgmstream/blob/master/src/meta/wwise.c
+                        // vgmstream should be able to convert all of the WEM files spit out by this to WAV without any issues
+
+                        long payloadOffset;
+                        int payloadLength;
+                        try
                         {
-                            var texture = Texture.Read(assetStream, forge.Version);
-                            // Filter only usefull textures
-                            if (texture.TexType == TextureType.Diffuse || texture.TexType == TextureType.Misc)
-                            {
-                                var surface = texture.ReadSurfaceBytes(assetStream);
-
-                                DumpTexture(outputDirectory, $"{texture.TexType}_{entry.Uid}", texture, surface);
-                            }
-
-                            break;
-                        }
-                    case AssetType.Sound:
-                        {
-                            // format notes: see https://github.com/vgmstream/vgmstream/blob/master/src/meta/wwise.c
-                            // vgmstream should be able to convert all of the WEM files spit out by this to WAV without any issues
-
                             var wem = WemSound.Read(assetStream, forge.Version);
-
-                            DumpBin(outputDirectory, $"id{entry.Uid}", assetStream.BaseStream, wem.PayloadOffset, wem.PayloadLength, "wem");
-
-                            break;
+                            (payloadOffset, payloadLength) = (wem.PayloadOffset, wem.PayloadLength);
                         }
-                    case AssetType.FlatArchive:
+                        catch (NotSupportedException)
                         {
+                            // v34+ name encoding broke the header-length heuristic; locate the RIFF chunk directly instead
+                            (payloadOffset, payloadLength) = FindRiff(assetStream.BaseStream);
+                        }
+
+                        DumpBin(outputDirectory, $"id{entry.Uid}", assetStream.BaseStream, payloadOffset, payloadLength, "wem");
+
+                        break;
+                    }
+                case AssetType.FlatArchive:
+                    {
 							var arc = FlatArchive.Read(forge, forgeAsset, assetStream);
 
-                            var arcDir = Path.Combine(outputDirectory, $"flatarchive_id{entry.Uid}");
+                        var arcDir = Path.Combine(outputDirectory, $"flatarchive_id{entry.Uid}");
 
-                            foreach (var arcEntry in arc.Entries)
-                            {
-                                var name = $"idx{arcEntry.Index}_filetype{arcEntry.MetaData.FileType}";
-
-                                if (Enum.IsDefined(typeof(Magic), (ulong)arcEntry.MetaData.FileType))
-                                    name += $"_{(Magic)arcEntry.MetaData.FileType}";
-
-                                DumpBin(arcDir, name, assetStream.BaseStream, arcEntry.PayloadOffset, arcEntry.PayloadLength);
-                            }
-
-                            break;
-                        }
-                    default:
+                        foreach (var arcEntry in arc.Entries)
                         {
-                            var name = $"id{entry.Uid}_filetype{entry.MetaData.FileType}";
+                            var name = $"idx{arcEntry.Index}_filetype{arcEntry.MetaData.FileType}";
 
-                            if (Enum.IsDefined(typeof(Magic), (ulong)entry.MetaData.FileType))
-                                name += $"_{(Magic)entry.MetaData.FileType}";
+                            if (Enum.IsDefined(typeof(Magic), (ulong)arcEntry.MetaData.FileType))
+                                name += $"_{(Magic)arcEntry.MetaData.FileType}";
 
-                            DumpBin(outputDirectory, name, assetStream.BaseStream);
-                            break;
+                            DumpBin(arcDir, name, assetStream.BaseStream, arcEntry.PayloadOffset, arcEntry.PayloadLength);
                         }
-                }
-            } else
-			{
-                // version >= 34
-                var texture = Texture.Read(assetStream, forge.Version);
-                // Filter only usefull textures
-                if (texture.TexType == TextureType.Diffuse || texture.TexType == TextureType.Misc)
-                {
-                    var surface = texture.ReadSurfaceBytes(assetStream);
 
-                    DumpTexture(outputDirectory, $"{texture.TexType}_{entry.Offset}_{entry.End}", texture, surface);
-                }
+                        break;
+                    }
+                default:
+                    {
+                        var name = $"id{entry.Uid}_filetype{fileType}";
+
+                        if (Enum.IsDefined(typeof(Magic), fileType))
+                            name += $"_{(Magic)fileType}";
+
+                        DumpBin(outputDirectory, name, assetStream.BaseStream);
+                        break;
+                    }
             }
+		}
+
+		private static (long Offset, int Length) FindRiff(Stream stream)
+		{
+			var buffer = new byte[stream.Length];
+			stream.Seek(0, SeekOrigin.Begin);
+			stream.ReadExactly(buffer);
+
+			for (var i = 0; i + 8 <= buffer.Length; i++)
+			{
+				if (buffer[i] != 'R' || buffer[i + 1] != 'I' || buffer[i + 2] != 'F' || buffer[i + 3] != 'F')
+					continue;
+
+				var length = BitConverter.ToInt32(buffer, i + 4) + 8;
+				return (i, Math.Min(length, buffer.Length - i));
+			}
+
+			throw new InvalidDataException("No RIFF chunk found in sound payload");
 		}
 
 		public static void DumpBin(string bank, string name, Stream stream, long writeOffset = 0, int writeLength = -1, string ext = "bin")

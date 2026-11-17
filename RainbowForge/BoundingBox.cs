@@ -34,5 +34,15 @@ namespace RainbowForge
 
 			return new BoundingBox(minX, minY, minZ, maxX, maxY, maxZ);
 		}
+
+		internal static BoundingBox ReadLegacy(BinaryReader r)
+		{
+			var center = r.ReadVector3();
+			var extent = r.ReadVector3();
+			r.ReadSingle();
+			var min = center - extent;
+			var max = center + extent;
+			return new BoundingBox(min.X, min.Y, min.Z, max.X, max.Y, max.Z);
+		}
 	}
 }

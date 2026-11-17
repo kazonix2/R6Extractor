@@ -26,7 +26,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\RainbowForge\RainbowForge.csproj" />
+        <ProjectReference Include="..\RainbowScimitar\RainbowScimitar.csproj" />
     </ItemGroup>
 
     <ItemGroup>
@@ -65,4 +65,19 @@
         <EmbeddedResource Include="Resources\bone.obj" />
     </ItemGroup>
 
+    <Target Name="RestorePrismAudio" BeforeTargets="AssignTargetPaths" Condition="'$(DesignTimeBuild)' != 'true'">
+        <PropertyGroup>
+            <PrismAudioDirectory>$(MSBuildProjectDirectory)/../target/audio-tools</PrismAudioDirectory>
+        </PropertyGroup>
+        <Exec Condition="!Exists('$(PrismAudioDirectory)/vgmstream/vgmstream-cli.exe') Or !Exists('$(PrismAudioDirectory)/ffmpeg.exe')"
+              Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../scripts/Restore-PrismAudio.ps1&quot; -Directory &quot;$(PrismAudioDirectory)&quot;" />
+        <ItemGroup>
+            <_PrismAudioFiles Include="$(PrismAudioDirectory)/vgmstream/**/*;$(PrismAudioDirectory)/ffmpeg.exe;$(PrismAudioDirectory)/FFmpeg-LICENSE.txt" />
+            <Content Include="@(_PrismAudioFiles)" Condition="Exists('%(_PrismAudioFiles.FullPath)')">
+                <Link>audio-tools/$([MSBuild]::MakeRelative('$(PrismAudioDirectory)', '%(_PrismAudioFiles.FullPath)'))</Link>
+                <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+                <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+            </Content>
+        </ItemGroup>
+    </Target>
 </Project>

@@ -47,6 +47,9 @@ namespace Prism.Render
 		private int _radianceTextureId;
 
 		private Vector2 _translation = new(0, 0);
+		private Vector3 _walkPosition;
+		private Vector2 _walkLook;
+		public bool WalkMode { get; private set; }
 		private Framebuffer _viewFbo;
 
 		private int _zoom = 1;
@@ -57,6 +60,16 @@ namespace Prism.Render
 		{
 			public VertexBuffer VertexBuffer { get; init; }
 			public int TextureId { get; init; } = -1;
+			public int NormalId { get; init; } = -1;
+			public int SpecularId { get; init; } = -1;
+			public int BlendId { get; init; } = -1;
+			public int BlendMaskId { get; init; } = -1;
+			public Vector2 BlendUvScale { get; init; }
+			public SceneTextureData.AlphaMode Alpha { get; init; }
+			public Vector3 Tint { get; init; }
+			public float GlassOpacity { get; init; }
+			public Vector2 UvScale { get; init; }
+			public Vector3 Center { get; init; }
 			public Matrix4[] Instances { get; init; } = [Matrix4.Identity];
 		}
 
@@ -138,9 +151,12 @@ namespace Prism.Render
 				_shaderModel.Uniforms.SetValue("texReflection", 2);
 				_shaderModel.Uniforms.SetValue("texRadiance", 3);
 				_shaderModel.Uniforms.SetValue("texUv", 4);
+				_shaderModel.Uniforms.SetValue("texNormal", 5);
+				_shaderModel.Uniforms.SetValue("texSpecular", 6);
+				_shaderModel.Uniforms.SetValue("texBlend", 7);
+				_shaderModel.Uniforms.SetValue("texBlendMask", 8);
 				_shaderModel.Uniforms.SetValue("colorIn", new Vector3(1, 1, 1));
 				_shaderModel.Uniforms.SetValue("lightPos", new Vector3(0.6f, -1, 0.8f));
-				_shaderModel.Uniforms.SetValue("lightColor", new Vector3(1f, 1f, 1f));
 				_shaderModel.Uniforms.SetValue("giAmbientColor", _bakedGi.AmbientColor);
 				_shaderModel.Uniforms.SetValue("giAmbientIntensity", _bakedGi.AmbientIntensity);
 				_shaderModel.Uniforms.SetValue("dynamicLightCount", 0);
@@ -177,7 +193,7 @@ namespace Prism.Render
 			}
 
 			var aspectRatio = width / (float)height;
-			var perspective = Matrix4.CreatePerspectiveFieldOfView(MathHelper.PiOver2, aspectRatio, 1f, 65536);
+			var perspective = Matrix4.CreatePerspectiveFieldOfView(MathHelper.PiOver2, aspectRatio, WalkMode ? 0.05f : 1f, 65536);
 
 			GL.Viewport(0, 0, width, height);
 
@@ -187,7 +203,7 @@ namespace Prism.Render
 			var rotation = Matrix4.CreateRotationY(MathHelper.DegreesToRadians(-_rotation.Y))
 			               * Matrix4.CreateRotationX(MathHelper.DegreesToRadians(-_rotation.X));
 
-			var view = rotation
+			var view = WalkMode ? Matrix4.CreateTranslation(-_walkPosition) * WalkRotation() : rotation
 			           * Matrix4.CreateScale((float)Math.Pow(10, _zoom / 10f) * Vector3.One)
 			           * Matrix4.CreateTranslation(_translation.X, _translation.Y, -10);
 
@@ -230,7 +246,16 @@ namespace Prism.Render
 				var settings = Settings;
 				_shaderModel.Uniforms.SetValue("useReflections", settings.Use3DReflections ? 1 : 0);
 				_shaderModel.Uniforms.SetValue("useCheckerboard", settings.Use3DCheckerboard ? 1 : 0);
-				UploadLightingUniforms();
+				var cameraPosition = Matrix4.Invert(view).ExtractTranslation();
+				UploadLightingUniforms(cameraPosition);
+				_shaderModel.Uniforms.SetValue("hasNormal", 0);
+				_shaderModel.Uniforms.SetValue("hasSpecular", 0);
+				_shaderModel.Uniforms.SetValue("uvScale", Vector2.One);
+				_shaderModel.Uniforms.SetValue("alphaMode", 0);
+				_shaderModel.Uniforms.SetValue("materialTint", Vector3.One);
+				_shaderModel.Uniforms.SetValue("glassOpacity", -1f);
+				_shaderModel.Uniforms.SetValue("hasBlend", 0);
+				_shaderModel.Uniforms.SetValue("cameraPosition", cameraPosition);
 
 				_shaderModel.Use();
 				if (_sceneBatches.Count == 0)
@@ -241,22 +266,37 @@ namespace Prism.Render
 				}
 				else
 				{
-					foreach (var batch in _sceneBatches)
+					foreach (var batch in _sceneBatches.Where(batch => batch.Alpha != SceneTextureData.AlphaMode.Blend))
 					{
-						GL.ActiveTexture(TextureUnit.Texture1);
-						GL.BindTexture(TextureTarget.Texture2D, batch.TextureId >= 0 ? batch.TextureId : 0);
-						_shaderModel.SetActiveValue("hasTexture", batch.TextureId >= 0 ? 1 : 0);
+						BindSceneMaterial(batch);
 						foreach (var instance in batch.Instances)
+							DrawSceneInstance(batch, instance * modelspace);
+					}
+					var transparent = _sceneBatches.Where(batch => batch.Alpha == SceneTextureData.AlphaMode.Blend)
+						.SelectMany(batch => batch.Instances.Select(instance => (Batch: batch, Model: instance * modelspace)))
+						.OrderBy(draw => Vector3.TransformPosition(draw.Batch.Center, draw.Model * view).Z);
+					GL.Enable(EnableCap.Blend);
+					GL.BlendFuncSeparate(BlendingFactorSrc.SrcAlpha, BlendingFactorDest.OneMinusSrcAlpha,
+						BlendingFactorSrc.One, BlendingFactorDest.OneMinusSrcAlpha);
+					GL.DepthMask(false);
+					try
+					{
+						SceneBatch bound = null;
+						foreach (var draw in transparent)
 						{
-							// Apply the Siege entity transform before converting the entire result
-							// into viewport coordinates. The previous order rotated local geometry
-							// but left translations in Siege space.
-							_shaderModel.SetActiveValue("m", instance * modelspace);
-							batch.VertexBuffer.Render(PrimitiveType.Triangles);
+							if (bound != draw.Batch)
+								BindSceneMaterial(bound = draw.Batch);
+							DrawSceneInstance(draw.Batch, draw.Model);
 						}
+					}
+					finally
+					{
+						GL.DepthMask(true);
+						GL.Disable(EnableCap.Blend);
 					}
 				}
 				_shaderModel.Release();
+				GL.ActiveTexture(TextureUnit.Texture1);
 
 				GL.Disable(EnableCap.Texture2D);
 			}
@@ -423,6 +463,43 @@ namespace Prism.Render
 			GL.End();
 		}
 
+		public void SetWalkMode(bool enabled)
+		{
+			if (WalkMode == enabled)
+				return;
+			if (enabled)
+			{
+				_walkLook = _rotation;
+				var orbitView = WalkRotation() *
+					Matrix4.CreateScale((float)Math.Pow(10, _zoom / 10f)) *
+					Matrix4.CreateTranslation(_translation.X, _translation.Y, -10);
+				_walkPosition = Matrix4.Invert(orbitView).ExtractTranslation();
+			}
+			WalkMode = enabled;
+			_renderContext.MarkDirty();
+		}
+
+		private Matrix4 WalkRotation() => Matrix4.CreateRotationY(MathHelper.DegreesToRadians(-_walkLook.Y)) *
+			Matrix4.CreateRotationX(MathHelper.DegreesToRadians(-_walkLook.X));
+
+		public void WalkLook(int deltaX, int deltaY)
+		{
+			_walkLook.X = Math.Clamp(_walkLook.X - deltaY * 0.15f, -89f, 89f);
+			_walkLook.Y = (_walkLook.Y - deltaX * 0.15f) % 360f;
+			_renderContext.MarkDirty();
+		}
+
+		public void WalkMove(Vector3 input, float seconds, bool sprint)
+		{
+			if (input == Vector3.Zero)
+				return;
+			if (input.LengthSquared > 1f)
+				input.Normalize();
+			var yaw = Matrix4.CreateRotationY(MathHelper.DegreesToRadians(_walkLook.Y));
+			_walkPosition += Vector3.TransformVector(input, yaw) * Math.Clamp(seconds, 0f, 0.05f) * (sprint ? 8f : 4f);
+			_renderContext.MarkDirty();
+		}
+
 		public void OnMouseMove(Point devPt, bool leftMouse, bool rightMouse)
 		{
 			var mousePoint = new Vector2(devPt.X, devPt.Y);
@@ -488,7 +565,7 @@ namespace Prism.Render
 			if (compiledMeshObject.Objects.Count == 0)
 				return;
 
-			ClearSceneBatches();
+			BeginTexturedScene();
 
 			_compiledMeshObject = compiledMeshObject;
 
@@ -523,7 +600,7 @@ namespace Prism.Render
 				objectIds,
 				compiledMeshObject.Objects
 					.Take((int)(compiledMeshObject.Objects.Count / compiledMeshObject.MeshHeader.NumLods))
-					.SelectMany(pointers => pointers.SelectMany(pointer => new uint[] { pointer.A, pointer.B, pointer.C })).ToArray()
+					.SelectMany(pointers => pointers.SelectMany(pointer => new[] { (uint)pointer.A, (uint)pointer.B, (uint)pointer.C })).ToArray()
 			);
 
 			_renderContext.MarkDirty();
@@ -557,13 +634,19 @@ namespace Prism.Render
 				var normals = mesh.Container.Normals ?? new System.Numerics.Vector3[vertexCount];
 				var texCoords = mesh.Container.TexCoords ?? new System.Numerics.Vector2[vertexCount];
 				var colors = new System.Numerics.Vector3[vertexCount];
+				if (mesh.Container.Colors != null)
+					for (var index = 0; index < vertexCount; index++)
+					{
+						var color = mesh.Container.Colors[0, index];
+						colors[index] = new System.Numerics.Vector3(color.R, color.G, color.B);
+					}
 				var objectIds = new int[vertexCount];
 				var lod0ObjectCount = mesh.Objects.Count / (int)mesh.MeshHeader.NumLods;
 
 				for (var objectIndex = 0; objectIndex < lod0ObjectCount; objectIndex++)
 				{
 					var elements = mesh.Objects[objectIndex]
-						.SelectMany(pointer => new uint[] { pointer.A, pointer.B, pointer.C })
+						.SelectMany(pointer => new[] { (uint)pointer.A, (uint)pointer.B, (uint)pointer.C })
 						.ToArray();
 					if (elements.Length == 0)
 						continue;
@@ -574,22 +657,22 @@ namespace Prism.Render
 
 					var vbo = new VertexBuffer();
 					vbo.InitializeVbo(mesh.Container.Vertices, normals, texCoords, colors, objectIds, elements);
-					var textureId = -1;
-					if (objectIndex < sceneMesh.ObjectTextures.Length && sceneMesh.ObjectTextures[objectIndex] != null)
-					{
-						var texture = sceneMesh.ObjectTextures[objectIndex];
-						if (!_sceneTextureIds.TryGetValue(texture.Uid, out textureId))
-						{
-							textureId = GL.GenTexture();
-							LoadSceneTexture(texture, textureId);
-							_sceneTextureIds[texture.Uid] = textureId;
-						}
-					}
+					var material = objectIndex < sceneMesh.Materials.Length ? sceneMesh.Materials[objectIndex] : null;
 
 					_sceneBatches.Add(new SceneBatch
 					{
 						VertexBuffer = vbo,
-						TextureId = textureId,
+						TextureId = GetSceneTexture(material?.Diffuse),
+						NormalId = material?.Normal?.Format == 6 ? GetSceneTexture(material.Normal) : -1,
+						SpecularId = GetSceneTexture(material?.Specular),
+						BlendId = GetSceneTexture(material?.BlendDiffuse),
+						BlendMaskId = GetSceneTexture(material?.BlendMask),
+						BlendUvScale = material?.BlendUvScale ?? Vector2.One,
+						Alpha = material?.Opacity ?? material?.Diffuse?.Alpha ?? SceneTextureData.AlphaMode.Opaque,
+						Tint = material?.Tint ?? Vector3.One,
+						GlassOpacity = material?.GlassOpacity ?? -1f,
+						UvScale = material?.UvScale ?? Vector2.One,
+						Center = GetPartCenter(mesh.Container.Vertices, elements),
 						Instances = sceneMesh.Instances
 					});
 				}
@@ -598,11 +681,75 @@ namespace Prism.Render
 			_renderContext.MarkDirty();
 		}
 
+		private void BindSceneMaterial(SceneBatch batch)
+		{
+			GL.ActiveTexture(TextureUnit.Texture1);
+			GL.BindTexture(TextureTarget.Texture2D, Math.Max(0, batch.TextureId));
+			_shaderModel.SetActiveValue("hasTexture", batch.TextureId >= 0 ? 1 : 0);
+			GL.ActiveTexture(TextureUnit.Texture5);
+			GL.BindTexture(TextureTarget.Texture2D, Math.Max(0, batch.NormalId));
+			_shaderModel.SetActiveValue("hasNormal", batch.NormalId >= 0 ? 1 : 0);
+			GL.ActiveTexture(TextureUnit.Texture6);
+			GL.BindTexture(TextureTarget.Texture2D, Math.Max(0, batch.SpecularId));
+			_shaderModel.SetActiveValue("hasSpecular", batch.SpecularId >= 0 ? 1 : 0);
+			GL.ActiveTexture(TextureUnit.Texture7);
+			GL.BindTexture(TextureTarget.Texture2D, Math.Max(0, batch.BlendId));
+			_shaderModel.SetActiveValue("hasBlend", batch.BlendId >= 0 ? 1 : 0);
+			GL.ActiveTexture(TextureUnit.Texture8);
+			GL.BindTexture(TextureTarget.Texture2D, Math.Max(0, batch.BlendMaskId));
+			_shaderModel.SetActiveValue("hasBlendMask", batch.BlendMaskId >= 0 ? 1 : 0);
+			_shaderModel.SetActiveValue("blendUvScale", batch.BlendUvScale);
+			_shaderModel.SetActiveValue("uvScale", batch.UvScale);
+			_shaderModel.SetActiveValue("alphaMode", (int)batch.Alpha);
+			_shaderModel.SetActiveValue("materialTint", batch.Tint);
+			_shaderModel.SetActiveValue("glassOpacity", batch.GlassOpacity);
+		}
+
+		private void DrawSceneInstance(SceneBatch batch, Matrix4 model)
+		{
+			_shaderModel.SetActiveValue("m", model);
+			batch.VertexBuffer.Render(PrimitiveType.Triangles);
+		}
+
+		private static Vector3 GetPartCenter(System.Numerics.Vector3[] vertices, uint[] indices)
+		{
+			var min = vertices[indices[0]];
+			var max = min;
+			foreach (var index in indices)
+			{
+				min = System.Numerics.Vector3.Min(min, vertices[index]);
+				max = System.Numerics.Vector3.Max(max, vertices[index]);
+			}
+			var center = (min + max) * 0.5f;
+			return new Vector3(center.X, center.Y, center.Z);
+		}
+
+		private int GetSceneTexture(SceneTextureData texture)
+		{
+			if (texture == null)
+				return -1;
+			if (_sceneTextureIds.TryGetValue(texture.Uid, out var existing))
+				return existing;
+			var id = GL.GenTexture();
+			try
+			{
+				LoadSceneTexture(texture, id);
+				_sceneTextureIds.Add(texture.Uid, id);
+				return id;
+			}
+			catch
+			{
+				GL.DeleteTexture(id);
+				throw;
+			}
+		}
+
 		private static void LoadSceneTexture(SceneTextureData texture, int textureId)
 		{
 			if (texture.BgraPixels.Length != checked(texture.Width * texture.Height * 4))
 				throw new InvalidDataException("Scene texture pixel buffer has an invalid length.");
 
+			GL.ActiveTexture(TextureUnit.Texture1);
 			GL.BindTexture(TextureTarget.Texture2D, textureId);
 			GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
 			var handle = GCHandle.Alloc(texture.BgraPixels, GCHandleType.Pinned);
@@ -616,10 +763,11 @@ namespace Prism.Render
 			{
 				handle.Free();
 			}
-			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
-			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
-			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
-			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+			GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
+			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.LinearMipmapLinear);
+			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
+			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
 		}
 
 		public void AppendDynamicLights(IEnumerable<SceneLight> lights)
@@ -632,23 +780,90 @@ namespace Prism.Render
 		public void SetBakedLighting(BakedGiLighting lighting)
 		{
 			_bakedGi = lighting ?? BakedGiLighting.Default;
+			if (_bakedGi.Grids.Length > 0)
+				_bakedGi = SampleBakedLighting(_bakedGi);
 			_renderContext.MarkDirty();
 		}
 
-		private void UploadLightingUniforms()
+		internal BakedGiLighting BakedLighting => _bakedGi;
+
+		private static BakedGiLighting SampleBakedLighting(BakedGiLighting lighting)
+		{
+			const int blocksPerRow = 32;
+			const int bytesPerBlock = 16;
+			const int width = blocksPerRow * 4;
+			var total = Vector3.Zero;
+			long totalCells = 0;
+			long sampleCount = 0;
+			GL.GetInteger(GetPName.TextureBinding2D, out int previousTexture);
+			var texture = GL.GenTexture();
+			try
+			{
+				GL.BindTexture(TextureTarget.Texture2D, texture);
+				foreach (var grid in lighting.Grids)
+				{
+					var blocks = grid.SampleTiles.Length / bytesPerBlock;
+					var rows = (blocks + blocksPerRow - 1) / blocksPerRow;
+					var compressed = new byte[rows * blocksPerRow * bytesPerBlock];
+					grid.SampleTiles.CopyTo(compressed, 0);
+					var height = rows * 4;
+					GL.CompressedTexImage2D(TextureTarget.Texture2D, 0, (InternalFormat)0x8E8F,
+						width, height, 0, compressed.Length, compressed);
+					if (GL.GetError() != ErrorCode.NoError)
+						return lighting;
+
+					var pixels = new float[width * height * 3];
+					GL.GetTexImage(TextureTarget.Texture2D, 0, PixelFormat.Rgb, PixelType.Float, pixels);
+					if (GL.GetError() != ErrorCode.NoError)
+						return lighting;
+					var sum = Vector3.Zero;
+					for (var block = 0; block < blocks; block++)
+					{
+						var start = (block / blocksPerRow * 4 * width + block % blocksPerRow * 4) * 3;
+						for (var y = 0; y < 4; y++)
+						for (var x = 0; x < 4; x++)
+						{
+							var i = start + (y * width + x) * 3;
+							var rgb = new Vector3(pixels[i], pixels[i + 1], pixels[i + 2]);
+							if (float.IsFinite(rgb.LengthSquared))
+								sum += rgb / (1f + Math.Max(rgb.X, Math.Max(rgb.Y, rgb.Z)));
+						}
+					}
+					var texels = blocks * 16;
+					total += sum * ((float)grid.CellCount / texels);
+					totalCells += grid.CellCount;
+					sampleCount += texels;
+				}
+			}
+			finally
+			{
+				GL.BindTexture(TextureTarget.Texture2D, previousTexture);
+				GL.DeleteTexture(texture);
+			}
+
+			var mean = total / totalCells;
+			var peak = Math.Max(mean.X, Math.Max(mean.Y, mean.Z));
+			return lighting with
+			{
+				AmbientColor = peak > 0.0001f ? mean / peak : Vector3.One,
+				AmbientIntensity = Math.Clamp(0.12f + peak, 0.12f, 0.65f),
+				SampleCount = sampleCount
+			};
+		}
+
+		private void UploadLightingUniforms(Vector3 cameraPosition)
 		{
 			_shaderModel.Uniforms.SetValue("giAmbientColor", _bakedGi.AmbientColor);
 			_shaderModel.Uniforms.SetValue("giAmbientIntensity", _bakedGi.AmbientIntensity);
-			var lightCount = Math.Min(MaxShaderLights, _dynamicLights.Count);
+			_shaderModel.Uniforms.SetValue("hasBakedGi", _bakedGi.SampleCount > 0 ? 1 : 0);
+			var lights = _dynamicLights.Count <= MaxShaderLights ? _dynamicLights :
+				_dynamicLights.OrderBy(light => Math.Max(0f, (Vector3.TransformPosition(light.Position,
+					SceneCoordinateConversion) - cameraPosition).Length - light.Radius)).Take(MaxShaderLights).ToList();
+			var lightCount = lights.Count;
 			_shaderModel.Uniforms.SetValue("dynamicLightCount", lightCount);
 			for (var index = 0; index < lightCount; index++)
 			{
-				// Evenly sample a large map's light set instead of retaining only the
-				// first loaded sector.
-				var sourceIndex = lightCount == _dynamicLights.Count
-					? index
-					: (int)((long)index * _dynamicLights.Count / lightCount);
-				var light = _dynamicLights[sourceIndex];
+				var light = lights[index];
 				var position = Vector3.TransformPosition(light.Position, SceneCoordinateConversion);
 				var direction = Vector3.Normalize(Vector3.TransformVector(light.Direction, SceneCoordinateConversion));
 				_shaderModel.Uniforms.SetValue($"dynamicLightPosition[{index}]", position);
@@ -657,6 +872,7 @@ namespace Prism.Render
 				_shaderModel.Uniforms.SetValue($"dynamicLightIntensity[{index}]", light.Intensity);
 				_shaderModel.Uniforms.SetValue($"dynamicLightRadius[{index}]", light.Radius);
 				_shaderModel.Uniforms.SetValue($"dynamicLightConeCosine[{index}]", light.OuterConeCosine);
+				_shaderModel.Uniforms.SetValue($"dynamicLightInnerConeCosine[{index}]", light.InnerConeCosine);
 				_shaderModel.Uniforms.SetValue($"dynamicLightKind[{index}]", light.Kind == SceneLightKind.Spot ? 1 : 0);
 			}
 		}
@@ -667,7 +883,7 @@ namespace Prism.Render
 			{
 				batch.VertexBuffer.Dispose();
 			}
-			foreach (var textureId in _sceneBatches.Select(batch => batch.TextureId).Where(id => id >= 0).Distinct())
+			foreach (var textureId in _sceneTextureIds.Values)
 				GL.DeleteTexture(textureId);
 			_sceneBatches.Clear();
 			_sceneTextureIds.Clear();

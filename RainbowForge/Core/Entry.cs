@@ -8,6 +8,7 @@ namespace RainbowForge.Core
 		public long Offset { get; }
 		public uint Size { get; }
 		public long End { get; }
+		internal bool HasExactChunkBounds { get; init; }
 
 		public EntryMetaData MetaData { get; set; }
 

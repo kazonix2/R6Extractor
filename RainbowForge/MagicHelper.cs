@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -47,11 +47,13 @@ namespace RainbowForge
 				Magic.GameBootstrap => AssetType.FlatArchive,
 				Magic.PlatformManager => AssetType.FlatArchive,
 				Magic.World => AssetType.FlatArchive,
+				Magic.WorldY11S3 or Magic.LoadUnitY11S3 => AssetType.FlatArchive,
 				Magic.LoadUnit => AssetType.FlatArchive,
 				Magic.CompiledSoundBank => AssetType.FlatArchive,
 				Magic.BuildTable => AssetType.FlatArchive,
 				Magic.CompiledMeshShapeDataObject => AssetType.FlatArchive,
 				Magic.GIStream => AssetType.FlatArchive,
+				Magic.GIStreamModern => AssetType.FlatArchive,
 				Magic.WorldMetaData => AssetType.FlatArchive,
 				_ => AssetType.Unknown
 			};

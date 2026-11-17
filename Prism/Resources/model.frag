@@ -4,11 +4,25 @@ uniform sampler2D texModel;
 uniform sampler2D texReflection;
 uniform sampler2D texUv;
 uniform sampler2D texRadiance;
+uniform sampler2D texNormal;
+uniform sampler2D texSpecular;
+uniform vec2 uvScale;
+uniform vec3 cameraPosition;
+uniform int hasNormal;
+uniform int hasSpecular;
+uniform int alphaMode;
+uniform vec3 materialTint;
+uniform float glassOpacity;
+uniform sampler2D texBlend;
+uniform sampler2D texBlendMask;
+uniform vec2 blendUvScale;
+uniform int hasBlend;
+uniform int hasBlendMask;
 
 uniform vec3 lightPos;
-uniform vec3 lightColor;
 uniform vec3 giAmbientColor;
 uniform float giAmbientIntensity;
+uniform int hasBakedGi;
 
 #define MAX_DYNAMIC_LIGHTS 64
 uniform int dynamicLightCount;
@@ -18,6 +32,7 @@ uniform vec3 dynamicLightColor[MAX_DYNAMIC_LIGHTS];
 uniform float dynamicLightIntensity[MAX_DYNAMIC_LIGHTS];
 uniform float dynamicLightRadius[MAX_DYNAMIC_LIGHTS];
 uniform float dynamicLightConeCosine[MAX_DYNAMIC_LIGHTS];
+uniform float dynamicLightInnerConeCosine[MAX_DYNAMIC_LIGHTS];
 uniform int dynamicLightKind[MAX_DYNAMIC_LIGHTS];
 
 uniform int useReflections;
@@ -48,59 +63,106 @@ vec3(0.28, 0.56, 0.56)
 vec4 GRAY80 = vec4(vec3(0.8), 1.0);
 vec4 WHITE = vec4(vec3(1.0), 1.0);
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0)
+vec3 srgbToLinear(vec3 value)
 {
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)),
+               step(vec3(0.04045), value));
+}
+
+vec3 linearToSrgb(vec3 value)
+{
+    value = max(value, vec3(0.0));
+    return mix(value * 12.92, 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055,
+               step(vec3(0.0031308), value));
 }
 
 void main()
 {
-    float specularStrength = 0.5;
-    float specularIntensity = 0.5;
+    vec2 uv = fragTexCoord * uvScale;
+    vec4 modelSample = hasTexture == 1 ? texture(texModel, uv) : vec4(1.0);
+    modelSample.rgb = srgbToLinear(modelSample.rgb);
+    if (hasBlend == 1)
+    {
+        vec4 layer = texture(texBlend, fragTexCoord * blendUvScale);
+        float weight = hasBlendMask == 1 ? texture(texBlendMask, uv).r : fragVertColor.r;
+        vec3 layerColor = srgbToLinear(layer.rgb);
+        modelSample.rgb = hasTexture == 1 ? mix(modelSample.rgb, layerColor, clamp(weight, 0.0, 1.0)) : layerColor;
+    }
     vec4 radianceSamp = mix(GRAY80, texture(texRadiance, matcapTexCoord), useReflections);
-    vec4 checkerSamp = mix(WHITE, texture(texUv, fragTexCoord), useCheckerboard);
+    vec4 checkerSamp = mix(WHITE, texture(texUv, uv), useCheckerboard);
     vec4 reflectionSamp = texture(texReflection, matcapTexCoord);
     vec3 norm = normalize(fragNormal);
+    if (hasNormal == 1)
+    {
+        vec3 dx = dFdx(fragPos), dy = dFdy(fragPos);
+        vec2 ux = dFdx(uv), uy = dFdy(uv);
+        float determinant = ux.x * uy.y - ux.y * uy.x;
+        if (abs(determinant) > 1e-10)
+        {
+            vec3 tangent = (dx * uy.y - dy * ux.y) / determinant;
+            tangent -= norm * dot(tangent, norm);
+            if (dot(tangent, tangent) > 1e-10)
+            {
+                tangent = normalize(tangent);
+                vec3 bitangent = cross(norm, tangent);
+                if (dot(bitangent, (dy * ux.x - dx * uy.x) / determinant) < 0.0)
+                    bitangent = -bitangent;
+                vec2 xy = texture(texNormal, uv).rg * 2.0 - 1.0;
+                vec3 mapped = vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+                norm = normalize(mat3(tangent, bitangent, norm) * mapped);
+            }
+        }
+    }
 
-    vec3 lightDir = normalize(lightPos);// light very far away, use direction only. If light has position: normalize(lightPos - fragPos)  
-    float diffuse = clamp(dot(norm, lightDir), -1, 1) * 0.3;
+    if ((alphaMode == 1 && modelSample.a < 0.5) || (alphaMode == 2 && glassOpacity < 0.0 && modelSample.a <= 0.0))
+        discard;
     vec3 lighting = giAmbientColor * giAmbientIntensity;
+    vec3 specular = vec3(0.0);
+    vec3 viewDirection = normalize(cameraPosition - fragPos);
+    float specularStrength = hasSpecular == 1 ? dot(texture(texSpecular, uv).rgb, vec3(0.333333)) : 0.0;
+    if (hasBakedGi == 0 && dynamicLightCount == 0)
+        lighting += vec3(max(dot(norm, normalize(lightPos)), 0.0) * 0.25);
     for (int index = 0; index < dynamicLightCount; ++index)
     {
         vec3 toLight = dynamicLightPosition[index] - fragPos;
-        float distanceToLight = length(toLight);
+        float distanceSquared = dot(toLight, toLight);
         float radius = max(dynamicLightRadius[index], 0.001);
-        if (distanceToLight >= radius)
+        float range = distanceSquared / (radius * radius);
+        if (range >= 1.0)
             continue;
-        vec3 directionToLight = toLight / max(distanceToLight, 0.001);
-        float attenuation = pow(1.0 - distanceToLight / radius, 2.0);
+        vec3 directionToLight = toLight * inversesqrt(max(distanceSquared, 1e-6));
+        float falloff = 1.0 - range * range;
+        float attenuation = falloff * falloff / max(distanceSquared, 0.25);
         float cone = 1.0;
         if (dynamicLightKind[index] == 1)
         {
             float coneDot = dot(normalize(dynamicLightDirection[index]), -directionToLight);
-            cone = smoothstep(dynamicLightConeCosine[index], min(1.0, dynamicLightConeCosine[index] + 0.12), coneDot);
+            float outer = dynamicLightConeCosine[index];
+            cone = smoothstep(outer, max(outer + 1e-5, dynamicLightInnerConeCosine[index]), coneDot);
         }
         float lambert = max(dot(norm, directionToLight), 0.0);
-        lighting += dynamicLightColor[index] * dynamicLightIntensity[index] * attenuation * cone * lambert;
+        vec3 incident = dynamicLightColor[index] * dynamicLightIntensity[index] * attenuation * cone;
+        lighting += incident * lambert;
+        if (specularStrength > 0.0 && lambert > 0.0)
+        {
+            vec3 halfDirection = normalize(directionToLight + viewDirection);
+            float highlight = pow(max(0.0, dot(norm, halfDirection)), 32.0);
+            specular += incident * (lambert * highlight * specularStrength);
+        }
     }
 
-    //phong r dot v ^ strength
-    // r - light off normal
-
-    vec3 appliedColor = fragVertColor;
-
-    appliedColor = COLOR_LOOKUP[fragObjectId % NUM_COLOR_LOOKUPS];
-
-    vec3 specR = reflect(lightDir, norm);
-    float nDotR = dot(specR, normalize(fragPos));
-    vec3 coloredSpec = clamp(pow(nDotR, pow(specularStrength + 1, 8)) * lightColor * specularIntensity, 0, 1);
-    vec4 modelSample = texture(texModel, fragTexCoord);
-    vec4 baseColor = mix(vec4(appliedColor, 1.0), modelSample, float(hasTexture));
-    vec3 combinedLighting = clamp(lighting + vec3(max(diffuse, 0.0)), vec3(0.0), vec3(2.5));
-    vec4 beforeMatCap = mix(checkerSamp, baseColor, hasTexture == 1 ? 1.0 : 0.5) * vec4(combinedLighting, 1);
-    vec4 beforeReflection = mix(beforeMatCap, radianceSamp * beforeMatCap, 0.75);
-
-    color = mix(beforeReflection, beforeReflection * reflectionSamp, 0.3 * useReflections);
-    //color = samp;
-
+    bool textured = hasTexture == 1 || hasBlend == 1;
+    vec3 baseColor = textured ? modelSample.rgb : (glassOpacity >= 0.0 || materialTint != vec3(1.0)
+        ? vec3(1.0) : srgbToLinear(mix(checkerSamp.rgb, COLOR_LOOKUP[fragObjectId % NUM_COLOR_LOOKUPS], 0.5)));
+    baseColor *= materialTint;
+    vec3 litColor = baseColor * lighting + specular;
+    if (useReflections == 1 && hasBakedGi == 0 && dynamicLightCount == 0)
+        litColor *= mix(vec3(1.0), radianceSamp.rgb, 0.75) * mix(vec3(1.0), reflectionSamp.rgb, 0.3);
+    float opacity = alphaMode == 2 ? modelSample.a : 1.0;
+    if (glassOpacity >= 0.0)
+    {
+        float facing = abs(dot(norm, viewDirection));
+        opacity = mix(glassOpacity, 0.85, pow(1.0 - clamp(facing, 0.0, 1.0), 5.0));
+    }
+    color = vec4(linearToSrgb(litColor), opacity);
 }

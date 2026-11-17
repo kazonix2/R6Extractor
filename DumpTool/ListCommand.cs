@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using CommandLine;
 using RainbowForge;
 using RainbowForge.Core;
@@ -17,7 +17,10 @@ namespace DumpTool
 
 			foreach (var forgeEntry in forge.Entries)
 			{
-				var magic = MagicHelper.GetFiletype(forgeEntry.MetaData.FileType);
+				// Forges v31+ have missing or zeroed metadata tables, so fall back to detecting the type
+				var magic = forgeEntry.MetaData?.FileType is { } ft && ft != 0
+					? MagicHelper.GetFiletype(ft)
+					: AssetTypeDetector.DetectAssetType(forge, forgeEntry);
 				Console.WriteLine($"{forgeEntry.Uid}: {magic}");
 			}
 		}

@@ -41,8 +41,9 @@ namespace RainbowForge
                     var fileType = r.ReadUInt32();
                     var uid = r.ReadUInt64();
 
-                    var name = NameEncoding.DecodeName(filename, fileType, uid, 0, NameEncoding.FILENAME_ENCODING_FILE_KEY_STEP);
-                    return new FileMetaData(Encoding.ASCII.GetString(name), filename, var1, fileType, uid);
+                    var name = version >= 34 ? string.Empty : Encoding.ASCII.GetString(
+                        NameEncoding.DecodeName(filename, fileType, uid, 0, NameEncoding.FILENAME_ENCODING_FILE_KEY_STEP));
+                    return new FileMetaData(name, filename, var1, fileType, uid);
                 }
                 case 31:
                 {
@@ -70,17 +71,25 @@ namespace RainbowForge
 					return new FileMetaData(Encoding.ASCII.GetString(name), filename, var1, fileType, uid);
 				}
 				case <= 29:
-				{
-					var fileType = r.ReadUInt32();
-					var var1 = r.ReadUInt32();
-					var var2 = r.ReadUInt32();
-					var uid = r.ReadUInt64();
-
-					return new FileMetaData("", Array.Empty<byte>(), var1, fileType, uid);
-				}
+					return ReadLegacy(r, hasNames: version == 29);
 				default:
 					throw new NotImplementedException($"Unsupported version {version}");
 			}
+		}
+
+		internal static FileMetaData ReadLegacy(BinaryReader r, bool hasNames)
+		{
+			var fileType = r.ReadUInt32();
+			var bodySize = r.ReadUInt32();
+			var nameLength = r.ReadUInt32();
+			var name = string.Empty;
+			if (hasNames && nameLength != 0)
+			{
+				if (nameLength > ushort.MaxValue || nameLength > r.BaseStream.Length - r.BaseStream.Position - sizeof(ulong))
+					throw new InvalidDataException("Legacy resource name extends beyond the header.");
+				name = Encoding.ASCII.GetString(r.ReadBytes((int)nameLength));
+			}
+			return CreateDetected(name, bodySize, fileType, r.ReadUInt64());
 		}
 	}
 }

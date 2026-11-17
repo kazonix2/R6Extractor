@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
@@ -60,7 +60,7 @@ namespace Prism
 
 		private PrismSettings _settings;
 
-		public PrismForm(string initialForgePath = null)
+		public PrismForm(params string[] initialForgePaths)
 		{
 			SuspendLayout();
 
@@ -153,6 +153,8 @@ namespace Prism
 								}
 							}),
 							new ToolStripSeparator(),
+							_multiForgeExportMenu,
+							_audioBatchMenu,
 							(_bDumpAsObjHeader = new ToolStripMenuItem("&Wavefront OBJ (*.obj)")
 							{
 								DropDownItems =
@@ -229,13 +231,14 @@ namespace Prism
 			{
 				using var ofd = new OpenFileDialog
 				{
-					Filter = "Forge Files|*.forge"
+					Filter = "Forge Files|*.forge",
+					Multiselect = true
 				};
 
 				if (ofd.ShowDialog() != DialogResult.OK)
 					return;
 
-				OpenForge(ofd.FileName);
+				SelectForgeFiles(ofd.FileNames);
 			};
 
 			_bGenerateFilelist.Click += (sender, args) =>
@@ -273,7 +276,10 @@ namespace Prism
 
 			_bDumpAsObjQuick.Click += CreateObjExportEventHandler();
 			_bDumpAsObjAs.Click += CreateObjExportEventHandler(true);
+			foreach (var format in new[] { "wav", "flac", "mp3" })
+				_audioBatchMenu.DropDownItems.Add(format.ToUpperInvariant(), null, async (_, _) => await ExportSelectedAudioAsync(format));
 
+			SetupMultiForgeExport();
 			_bResetViewport.Click += (sender, args) => _renderer3d.ResetView();
 
 			SetupRenderer();
@@ -282,8 +288,19 @@ namespace Prism
 			UpdateAbility(null);
 
 			_settings = PrismSettings.Load(SETTINGS_FILENAME);
-			if (!string.IsNullOrWhiteSpace(initialForgePath))
-				Shown += (_, _) => OpenForge(initialForgePath);
+			AllowDrop = true;
+			DragEnter += (_, e) =>
+			{
+				if (e.Data?.GetData(DataFormats.FileDrop) is string[] files && files.Any(IsForgeFile))
+					e.Effect = e.AllowedEffect & DragDropEffects.Copy;
+			};
+			DragDrop += (_, e) =>
+			{
+				if (e.Data?.GetData(DataFormats.FileDrop) is string[] files)
+					SelectForgeFiles(files);
+			};
+			if (initialForgePaths.Length > 0)
+				Shown += (_, _) => SelectForgeFiles(initialForgePaths);
 		}
 
 		private EventHandler CreateDumpEventHandler(Action<string, object> action, bool saveAs = false)
@@ -305,6 +322,7 @@ namespace Prism
 
 				foreach (var selectedObject in _assetList.SelectedObjects)
 				{
+					ActivateForge(_assetList.GetForge(selectedObject));
 					action(outputPath, selectedObject);
 				}
 			};
@@ -328,6 +346,7 @@ namespace Prism
 				{
 					try
 					{
+						ActivateForge(_assetList.GetForge(selectedObject));
 						var exportedPath = await ExportSelectionAsObjAsync(outputPath, selectedObject);
 						if (File.Exists(exportedPath))
 							MessageBox.Show(this, $"Complete map exported to:\n{exportedPath}", "OBJ Export",
@@ -348,6 +367,10 @@ namespace Prism
 
 		private void SetPreviewPanel(Control control)
 		{
+			if (control != _audioPreview)
+				ResetAudioPreview();
+			if (control != _glControl)
+				EndWalkMode();
 			using (_splitContainer.Panel2.SuspendPainting())
 			{
 				_splitContainer.Panel2.Controls.Clear();
@@ -364,9 +387,31 @@ namespace Prism
 			_imageControl.PaintSurface += (sender, args) => { _renderer2d.Render(args); };
 
 			_renderer3d = new ModelRenderer(new GlControlContext(_glControl), () => _settings);
-			_glControl.MouseDown += (sender, args) => _renderer3d.OnMouseDown(args.Location);
-			_glControl.MouseMove += (sender, args) => _renderer3d.OnMouseMove(args.Location, (args.Button & MouseButtons.Left) != 0, (args.Button & MouseButtons.Right) != 0);
-			_glControl.MouseWheel += (sender, args) => _renderer3d.OnMouseWheel(args.Delta);
+			_glControl.MouseDown += (sender, args) =>
+			{
+				_glControl.Focus();
+				_renderer3d.OnMouseDown(args.Location);
+			};
+			_glControl.MouseMove += (sender, args) =>
+			{
+				if (_renderer3d.WalkMode)
+				{
+					var center = new Point(_glControl.Width / 2, _glControl.Height / 2);
+					if (center != args.Location)
+					{
+						_renderer3d.WalkLook(args.X - center.X, args.Y - center.Y);
+						Cursor.Position = _glControl.PointToScreen(center);
+					}
+				}
+				else
+					_renderer3d.OnMouseMove(args.Location, (args.Button & MouseButtons.Left) != 0, (args.Button & MouseButtons.Right) != 0);
+			};
+			_glControl.MouseWheel += (sender, args) =>
+			{
+				if (!_renderer3d.WalkMode)
+					_renderer3d.OnMouseWheel(args.Delta);
+			};
+			SetupWalkControls();
 
 			_glControl.Paint += (sender, args) =>
 			{
@@ -402,7 +447,9 @@ namespace Prism
 			var searchGroups = filter.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 			var groupMatches = new List<bool>();
 
-			var meta = entry is Entry forgeEntry ? GetDetectedAssetMetaData(forgeEntry) : GetAssetMetaData(entry);
+			var meta = entry is Entry forgeEntry ? GetDetectedAssetMetaData(forgeEntry, _assetList.GetForge(forgeEntry)) : GetAssetMetaData(entry);
+			if (meta == null)
+				return false;
 
 			foreach (var t in searchGroups)
 			{
@@ -425,7 +472,7 @@ namespace Prism
 					continue;
 				}
 
-				groupMatches.Add(meta.Filename.Contains(t, StringComparison.OrdinalIgnoreCase));
+				groupMatches.Add(meta.Filename?.Contains(t, StringComparison.OrdinalIgnoreCase) ?? false);
 			}
 
 			return groupMatches.All(x => x);
@@ -433,6 +480,7 @@ namespace Prism
 
 		private async void OnAssetListOnSelectionChanged(object sender, EventArgs args)
 		{
+			ResetAudioPreview();
 			if (_assetList.SelectedObjects.Count < 1) return;
 			var selectedEntry = _assetList.SelectedObjects[0]; // TODO: find a way to get the last selected index to preview the latest selected asset
 			var stream = GetAssetStream(selectedEntry);
@@ -440,10 +488,13 @@ namespace Prism
 				return;
 
 			_previewCancellation?.Cancel();
+			ActivateForge(_assetList.GetForge(selectedEntry));
 			UpdateAbility(stream);
 
 			if (IsWorldScene(stream))
 			{
+				var forge = _openedForge;
+				var resolver = _dependencyResolver;
 				var cancellation = _previewCancellation = new CancellationTokenSource();
 				List<TexturedSceneMesh> scene = null;
 				var renderedMeshes = 0;
@@ -472,23 +523,30 @@ namespace Prism
 							renderedMeshes += meshChunk.Count;
 							loadedLights += lightChunk.Count;
 							_statusForgeInfo.Text = $"Streaming scene: {renderedMeshes:N0} mesh set(s), {loadedLights:N0} dynamic light(s)...";
-						})), cancellation.Token);
+						}), loadTextures: true, forge, resolver), cancellation.Token);
 					if (cancellation.IsCancellationRequested)
 						return;
 
-					_statusForgeInfo.Text = "Loading baked GI coefficients...";
-					var bakedGi = await Task.Run(() => SceneLightingReader.TryReadBakedGi(_openedForge.SourcePath, cancellation.Token), cancellation.Token);
+					_statusForgeInfo.Text = "Reading baked GI bank...";
+					var bakedGi = await Task.Run(() => SceneLightingReader.TryReadBakedGi(forge.SourcePath, cancellation.Token), cancellation.Token);
 					if (cancellation.IsCancellationRequested)
 						return;
 					using (_glControl.SuspendPainting())
 					{
 						_glControl.MakeCurrent();
 						_renderer3d.SetBakedLighting(bakedGi);
+						bakedGi = _renderer3d.BakedLighting;
 					}
-					var giStatus = bakedGi.SampleCount > 0
-						? $"GI approximation: {bakedGi.SampleCount:N0} coefficient samples"
-						: "GI bank unavailable; using neutral ambient";
-					_statusForgeInfo.Text = $"Rendered {scene.Count:N0} textured mesh set(s), {loadedLights:N0} dynamic light(s). {giStatus}.";
+					var giStatus = bakedGi.Grids.Length > 0
+						? bakedGi.SampleCount > 0
+							? $"Baked GI ambient from {bakedGi.Grids.Length:N0} grids and {bakedGi.SampleCount:N0} HDR texels"
+							: $"Read {bakedGi.Grids.Length:N0} GI grids, HDR decoding unavailable"
+						: bakedGi.SampleCount > 0
+							? $"Legacy GI ambient from {bakedGi.SampleCount:N0} coefficient samples"
+							: "Using neutral ambient";
+					var boundParts = scene.Sum(mesh => mesh.Materials.Count(material =>
+						material?.Diffuse != null || material?.Normal != null || material?.Specular != null || material?.BlendDiffuse != null));
+					_statusForgeInfo.Text = $"Rendered {scene.Count:N0} mesh set(s), {boundParts:N0} parts with material maps, {loadedLights:N0} dynamic light(s). {giStatus}.";
 				}
 				catch (OperationCanceledException)
 				{

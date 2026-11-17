@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 
 namespace RainbowForge
 {
@@ -34,6 +34,7 @@ namespace RainbowForge
 		LoadUnit = 0x943945C4,
 		WorldMetaData = 0x3E237DA3,
 		GIStream = 0xD16E3EBE,
+		GIStreamModern = 0xDA9D16FF,
 		CompiledMeshShapeDataObject = 0x9231EE0F,
 		CompiledSoundBank = 0x82688E42,
 		ShaderCodeModuleUserMaterial = 0x1C9A0555,
@@ -476,6 +477,15 @@ namespace RainbowForge
 		ConstraintStrengthType = 0x2B1E772F,
 		MaterialPostFXConfig = 0x4EC26571,
 		FireData = 0xAF43CA83,
+		PhoenixImage = 0x87CE3D94,
+		PhoenixTexture = 0x07CA0C90,
+		PhoenixSfntFont = 0x9770EC87,
+		WorldY11S3 = 0xB4F9751B,
+		LoadUnitY11S3 = 0xFAEB9AB4,
+		EntityY11S3 = 0x3ADFCF6C,
+		MeshY11S3 = 0x7DFEB735,
+		MaterialY11S3 = 0x505A2021,
+		DestructionMeshGroupY11S3 = 0x49191185,
 		R6PresentationColorsConfig = 0xFE41FE3A,
 		R6LocalizationTagConfig = 0x36DD627F,
 		AIReactionPack = 0x6221143B,
@@ -852,10 +862,14 @@ namespace RainbowForge
 	public enum ContainerMagic : uint
 	{
 		Descriptor = 1,
+		LegacyStreamingDirectory = 2,
+		AprilAlphaFastLoad = 3,
+		LegacyFastLoad = 5,
 		Hash = 6,
 
 		// This entire assumption is incorrect and why
 		// RF is being replaced by RS
+		FileLzo = 0x57FBAA33,
 		File = 0x57FBAA34,
 		File2 = 0x57FBAA36,
 		File3 = 0x57FBAA37

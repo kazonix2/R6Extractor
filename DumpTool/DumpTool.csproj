@@ -13,7 +13,9 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\RainbowForge\RainbowForge.csproj" />
+      <ProjectReference Include="..\RainbowScimitar\RainbowScimitar.csproj" />
+      <EmbeddedResource Include="UiWeb\*" />
+      <EmbeddedResource Include="StartScreen\*" />
     </ItemGroup>
 
     <ItemGroup>

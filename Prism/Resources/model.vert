@@ -41,7 +41,7 @@ void main()
     mat4 MVP = p*v*m;
     gl_Position =  MVP * vec4(position, 1.);
     fragPos = worldPosition.xyz;
-    vec3 v_normal = normalize(vec3(v * (m * vec4(fragNormal, 0.0))));
+    vec3 v_normal = normalize(mat3(v) * fragNormal);
     matcapTexCoord = v_normal.xy * vec2(0.5, -0.5) + vec2(0.5, 0.5);
     //vec3 viewVector = normalize(world)
 }

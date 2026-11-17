@@ -49,8 +49,21 @@ namespace RainbowForge.Model
 		{
 			r.BaseStream.Seek(header.VertBlockOffset, SeekOrigin.Begin);
 
-			var container = CreateObjectContainer(header.Revision, header.VertLen, header.NumVerts);
+			var container = header.HasLegacyLayout
+				? ReadLegacyVertices(r, header)
+				: ReadVertices(r, header);
 
+			var objects = ParseFaceBlocks(r, header);
+			var vertMaps = ParseVertMaps(r, header);
+			var faceStatBlocks = ParseFaceStatBlocks(r, header);
+			var unknownFaceData = ParseUnknownFaceData(r, header);
+
+			return new CompiledMeshObject(header, container, objects, vertMaps, faceStatBlocks, unknownFaceData);
+		}
+
+		private static MeshObjectContainer ReadVertices(BinaryReader r, MeshHeader header)
+		{
+			var container = CreateObjectContainer(header.Revision, header.VertLen, header.NumVerts);
 			switch (header.Revision)
 			{
 				case 0:
@@ -89,12 +102,20 @@ namespace RainbowForge.Model
 							for (var i = 0; i < header.NumVerts; i++)
 								container.Normals[i] = r.ReadUInt32AsVec();
 
-							if (header.VertLen == 0x1C)
-								for (var i = 0; i < header.NumVerts; i++)
-									container.Colors[0, i] = r.ReadUInt32AsColor();
+							// Compact vertices use the same separate attribute streams as the
+							// float-position layout: position, normal, tangent, binormal, UV, color.
+							// Reading UVs here previously interpreted packed tangent bytes as half floats.
+							for (var i = 0; i < header.NumVerts; i++)
+								container.Tangents[i] = r.ReadUInt32AsVec();
+							for (var i = 0; i < header.NumVerts; i++)
+								container.Binormals[i] = r.ReadUInt32AsVec();
 
 							for (var i = 0; i < header.NumVerts; i++)
 								container.TexCoords[i] = r.ReadUInt32AsUv();
+
+							if (header.VertLen == 0x1C)
+								for (var i = 0; i < header.NumVerts; i++)
+									container.Colors[0, i] = r.ReadUInt32AsColor();
 
 							break;
 						}
@@ -146,17 +167,43 @@ namespace RainbowForge.Model
 				}
 			}
 
-			// read tris
-			var objects = ParseFaceBlocks(r, header);
+			return container;
+		}
 
-			// vert maps
-			var vertMaps = ParseVertMaps(r, header);
+		private static MeshObjectContainer ReadLegacyVertices(BinaryReader r, MeshHeader header)
+		{
+			if (header.Revision > 2 || header.VertsDataLen % header.VertLen != 0)
+				throw new InvalidDataException("Invalid legacy mesh vertex buffer.");
 
-			var faceStatBlocks = ParseFaceStatBlocks(r, header);
+			var compact = header.VertLen is 0x18 or 0x1c;
+			var hasAttributes = header.VertLen != 0x5c;
+			var vertices = new MeshObjectContainer
+			{
+				Vertices = new Vector3[header.NumVerts],
+				Normals = hasAttributes ? new Vector3[header.NumVerts] : null,
+				Tangents = hasAttributes ? new Vector3[header.NumVerts] : null,
+				Binormals = hasAttributes && !compact ? new Vector3[header.NumVerts] : null,
+				TexCoords = hasAttributes ? new Vector2[header.NumVerts] : null,
+				Colors = compact ? new Color4[1, header.NumVerts] : null
+			};
 
-			var unknownFaceData = ParseUnknownFaceData(r, header);
-
-			return new CompiledMeshObject(header, container, objects, vertMaps, faceStatBlocks, unknownFaceData);
+			for (var i = 0; i < vertices.Vertices.Length; i++)
+			{
+				var nextVertex = r.BaseStream.Position + header.VertLen;
+				vertices.Vertices[i] = compact ? r.ReadUInt64AsPos() : r.ReadVector3();
+				if (hasAttributes)
+				{
+					vertices.Normals[i] = r.ReadUInt32AsVec();
+					vertices.Tangents[i] = r.ReadUInt32AsVec();
+					if (compact)
+						vertices.Colors[0, i] = r.ReadUInt32AsColor();
+					else
+						vertices.Binormals[i] = r.ReadUInt32AsVec();
+					vertices.TexCoords[i] = r.ReadUInt32AsUv();
+				}
+				r.BaseStream.Position = nextVertex;
+			}
+			return vertices;
 		}
 
 		private static UnknownFaceDataBlock[] ParseUnknownFaceData(BinaryReader r, MeshHeader header)
@@ -171,6 +218,8 @@ namespace RainbowForge.Model
 
 		private static FaceBlockStat[] ParseFaceStatBlocks(BinaryReader r, MeshHeader header)
 		{
+			if (header.HasLegacyLayout && header.Revision == 0)
+				return [];
 			r.BaseStream.Seek(header.ExtraDataStart + header.VertmapsDataLen + header.UnknownBlock1Len, SeekOrigin.Begin);
 
 			var stats = new FaceBlockStat[header.FaceDataLen / FaceChunkSize];
@@ -207,20 +256,38 @@ namespace RainbowForge.Model
 			r.BaseStream.Seek(header.TrisBlockStart, SeekOrigin.Begin);
 
 			var objects = new List<TrianglePointer[]>();
+			// Early revision-0 meshes store unpadded triangles instead of 64-triangle chunks.
+			var trianglesPerUnit = header.HasLegacyLayout && header.Revision == 0 ? 1 : TrisInChunk;
+			var faceUnitSize = trianglesPerUnit * 3 * sizeof(ushort);
 
 			foreach (var islandMeta in header.ObjectHeaders)
 			{
-				var triIndices = new TrianglePointer[islandMeta.NumFaceChunks * TrisInChunk];
+				var vertexBase = 0;
+				if (header.HasLegacyLayout)
+				{
+					var offset = (long)islandMeta.OffsetFaceChunks * faceUnitSize;
+					var length = (long)islandMeta.NumFaceChunks * faceUnitSize;
+					if (length != 0 && offset + length > header.FaceDataLen)
+						throw new InvalidDataException("Mesh part extends beyond the face buffer.");
+					r.BaseStream.Position = header.TrisBlockStart + offset;
+					vertexBase = checked((int)islandMeta.OffsetVerts);
+				}
+				var triIndices = new TrianglePointer[checked(islandMeta.NumFaceChunks * trianglesPerUnit)];
 				for (var i = 0; i < triIndices.Length; i++)
 				{
 					var a = r.ReadUInt16();
 					var b = r.ReadUInt16();
 					var c = r.ReadUInt16();
-					triIndices[i] = new TrianglePointer(a, b, c);
+					triIndices[i] = new TrianglePointer(vertexBase + a, vertexBase + b, vertexBase + c);
 				}
 
 				if (triIndices.Length > 0)
-					objects.Add(triIndices.Where(t => t.A != t.B && t.B != t.C).ToArray());
+				{
+					var triangles = triIndices.Where(t => t.A != t.B && t.B != t.C && (!header.HasLegacyLayout || t.A != t.C)).ToArray();
+					if (header.HasLegacyLayout && triangles.Any(t => (uint)t.A >= header.NumVerts || (uint)t.B >= header.NumVerts || (uint)t.C >= header.NumVerts))
+						throw new InvalidDataException("Mesh face references a vertex outside the vertex buffer.");
+					objects.Add(triangles);
+				}
 				else
 					objects.Add(Array.Empty<TrianglePointer>());
 			}

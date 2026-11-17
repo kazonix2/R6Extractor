@@ -1,0 +1,63 @@
+Forge v34 (Y11S3) format notes
+==============================
+
+Header / FAT
+- Same scimitar header as v27-33: MaxFile at 0x22, table descriptor pointer at 0x46,
+  descriptor -> (maxFile, maxDir, posFat, nextPosFat, firstIndex, lastIndex, metaTableOffset, directoryOffset).
+- FAT records are still 20 bytes (offset u64, uid u64, size u32) and stored in offset order, but obfuscated.
+  The high halves of each field's key are constant across files (offset 0x2cbcb973..., uid 0x0959...),
+  while the low bits vary per record. Neither a constant XOR/add key, a (v+A)^B / (v^A)+B form, an
+  8-byte keystream stepped per block, nor keys derived from the other fields fit. Unsolved, so the
+  reader still locates entries by scanning 4K pages for block headers.
+
+Block headers
+- 37aafb5799fa1510 03000f0000048001 <u32 n><u32 n>; n was always 0x20 before v34, now varies (0x10, 0x4c, 0x58, ...).
+
+Entry payloads
+- Every asset carries a meta block: u32 count, then count rows of (u64 uid, u32 length).
+  count == 1 means a plain asset; count > 1 is a separated archive.
+  Length bit 30 (0x40000000) marks a row followed by an extra 16-byte block (seen on textures and sounds).
+- The data payload starts with the v32+ FileMetaData layout:
+  u16 nameLen | u16 containerType (always 2) | u32 hash? | name[nameLen] | u32 fileType | u64 uid
+  fileType and uid are plaintext and match the meta block.
+
+Soundmedia banks
+- No compressed blocks; raw page-aligned RIFF/WEM files. FAT count = RIFF count + 2.
+
+Filenames (unsolved)
+- The old NameEncoding key (BASE + uid + fileType*(2^32+1), FILE or ENTRY step) gives random output in v34;
+  so do keys built from the u32 before the name, from the uid alone, or a constant.
+- The last 4 bytes of the name field are a small u32 (0x650, 0x9b0, 0x840, ...), likely not part of the string.
+- Byte entropy is periodic with 8: positions 3, 4 and 7 of each block are low-entropy, so it is still 8-byte-block based.
+- For meshshape entries (0x9231EE0F) whose uids differ only by 0x200000000000, the encoded names differ in a few
+  bits at the SAME bit positions in every block (e.g. 0x20000000018000). That suggests a bitwise-linear transform
+  where a change in one block carries into the following blocks, rather than a uid-seeded keystream.
+- The cipher is arithmetic, not XOR: across 3267 same-type names, c1-c0 (mod 2^64) takes 1080 distinct values
+  while c1^c0 takes 2484.
+- The key is linear in the uid. For runs of consecutive uids (e.g. type 0xA0B5862C, uid 0xD7AF98F9..0xD7AF9908 in
+  datapc64.forge) the per-block ciphertext step for uid+1 is 0xFFFC000001000000 (= 2^24 - 2^50) most often,
+  sometimes 0x0004000001000000, so the bit-50 term behaves like an XOR. The same step shows up in every
+  8-byte block, so the uid term is added to each block's key.
+- After removing that uid term, block 0 bytes 0-1 decode to the constant 55 53 for every entry in every group,
+  but the residual key still varies with the uid's high dword, so the exact combination is not pinned down yet.
+- The u32 before the name (v2) also looks obfuscated with the uid (it steps by -4 / +0xC on consecutive uids).
+- The old constants (0xA860F0ECDE3339FB, 0xE684BFF857699452, 0x357267C76FFB9EB2) are absent from the Y11S3
+  executable, so the routine was rewritten rather than just re-keyed.
+- A sweep of all 278 forges (1.3M name headers) found no GameBootstrap (0xE5A83560) entry and no uid 0x800,
+  so there is no known-plaintext anchor yet. uid 0x800 is only referenced (as a link) from datapc64.forge entries.
+
+Entry detection
+- Page-aligned entries are identified by the magic plus the low 7 bytes of the second qword (03000f00000480).
+  The top byte of that qword (0x01/0x04/0x09) and the whole third qword vary; requiring equal halves in the
+  third qword missed 29 of 110 entries in datapc64.forge.
+
+Y11S3 executable (RainbowSix_dump.exe) static analysis so far
+- Image base 0x7ff644990000, .text 0x1000-0xfbb4000. .pdata is scrambled (start RVAs of 1, absurd lengths;
+  only 83 of 335750 entries are plausible), so function boundaries must be recovered another way.
+- The "scimitar" string in .data (0x10c38be8) is a logging channel name (every xref feeds the log call at
+  0x1fdd230), not the archive magic check.
+- The container reader lives around 0x27e6000-0x2835000: block magics are built as movabs immediates
+  (0x1014fa9957fbaa34, 0x1004fa9957fbaa33, ...) and compared at 0x2802240 / 0x283492e. The surrounding code
+  is MBA/opaque-predicate obfuscated (hundreds of random 64-bit constants per 64 KB), and reads go through
+  stream vtable slots (+0xb8 u16, +0xc8 u32, +0xd8 u8).
+- Neither "GameBootstrap" (ASCII/UTF-16) nor the 0xE5A83560 type magic occurs anywhere in the dump.

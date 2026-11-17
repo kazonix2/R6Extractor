@@ -20,10 +20,16 @@ namespace Prism
 			if (File.Exists(Environment.GetEnvironmentVariable("OODLE2_8_PATH")))
 				OodleHelper.EnsureOodleLoaded();
 
+			if (args.Length > 0 && args[0] == "--export-scene")
+			{
+				Environment.ExitCode = SceneExporter.Run(args);
+				return;
+			}
+
 			Application.SetHighDpiMode(HighDpiMode.SystemAware);
 			Application.EnableVisualStyles();
 			Application.SetCompatibleTextRenderingDefault(false);
-			Application.Run(new PrismForm(args.FirstOrDefault(File.Exists)));
+			Application.Run(new PrismForm(args));
 		}
 	}
 }

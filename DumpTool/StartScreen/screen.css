@@ -1,0 +1,20 @@
+:root { background: #000; color: white; color-scheme: dark; }
+body { margin: 0; }
+main { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; }
+#stage {
+  display: block;
+  width: min(100vw, calc(100vh * var(--aspect, 16 / 9)));
+  height: auto;
+  max-height: 100vh;
+}
+#start {
+  position: absolute;
+  padding: 0;
+  color: transparent;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+#start:disabled { pointer-events: none; }
+#start:focus-visible { outline: 1px solid white; }
+#status { position: absolute; bottom: 1rem; padding: .5rem 1rem; font: 1rem system-ui, sans-serif; background: #161616; }

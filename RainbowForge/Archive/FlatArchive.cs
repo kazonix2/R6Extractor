@@ -1,8 +1,9 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using RainbowForge.Core;
 using RainbowForge.Core.Container;
+using RainbowForge.Core.DataBlock;
 using System;
 
 namespace RainbowForge.Archive
@@ -31,18 +32,20 @@ namespace RainbowForge.Archive
 		}
 
 		/// <summary>
-		/// Reads Siege v31-v33 archives whose UID/length table is stored in the
+		/// Reads archives whose UID/length table is stored in the
 		/// ForgeAsset metadata block and whose payload block contains concatenated files.
 		/// </summary>
 		public static FlatArchive Read(Forge forge, ForgeAsset asset, BinaryReader payloadStream)
 		{
-			if (forge.Version is < 31 or > 33 || !asset.HasMeta)
+			var legacyDirectory = forge.Version < 31 && asset.MetaBlock is ChunkedDataBlock { UseLzo: true };
+			if (!asset.HasMeta || (forge.Version < 31 && !legacyDirectory))
 				return Read(payloadStream, forge.Version);
 
 			using var metadataStream = asset.GetMetaDataStream(forge);
-			if (metadataStream.BaseStream.Length < sizeof(int)) throw new InvalidDataException("Separated archive metadata is truncated.");
-			var count = metadataStream.ReadInt32();
-			if (count < 0 || 4L + count * 12L > metadataStream.BaseStream.Length)
+			var countSize = legacyDirectory ? sizeof(ushort) : sizeof(int);
+			if (metadataStream.BaseStream.Length < countSize) throw new InvalidDataException("Separated archive metadata is truncated.");
+			var count = legacyDirectory ? metadataStream.ReadUInt16() : metadataStream.ReadInt32();
+			if (count < 0 || countSize + count * 12L > metadataStream.BaseStream.Length)
 				throw new InvalidDataException("Separated archive UID/length table is invalid.");
 
 			var entries = new List<FlatArchiveEntry>(count);
@@ -50,34 +53,104 @@ namespace RainbowForge.Archive
 			for (var index = 0; index < count; index++)
 			{
 				var uid = metadataStream.ReadUInt64();
-				var length = checked((int)metadataStream.ReadUInt32());
+				var rawLength = metadataStream.ReadUInt32();
+				var length = checked((int)(rawLength & 0x3FFFFFFF));
+				// v34+: bit 30 marks a row followed by an extra 16-byte block (seen on textures and sounds)
+				if ((rawLength & 0x40000000) != 0)
+				{
+					if (metadataStream.BaseStream.Length - metadataStream.BaseStream.Position < 16)
+						throw new InvalidDataException("Separated archive length extension is truncated.");
+					metadataStream.BaseStream.Seek(16, SeekOrigin.Current);
+				}
 				if (payloadOffset + length > payloadStream.BaseStream.Length)
 					throw new EndOfStreamException("Separated archive payload exceeds the data block.");
-				var detected = DetectPayloadMetadata(payloadStream, forge.Version, uid, length, payloadOffset);
-				entries.Add(FlatArchiveEntry.CreateDetected(detected, index, payloadOffset, length));
+				var (detected, headerLen) = legacyDirectory
+					? ReadLegacyMember(payloadStream, uid, length, payloadOffset)
+					: DetectPayloadMetadata(payloadStream, forge.Version, uid, length, payloadOffset);
+				entries.Add(FlatArchiveEntry.CreateDetected(detected, index, payloadOffset, length, headerLen));
 				payloadOffset += length;
 			}
+			if (legacyDirectory && (payloadOffset != payloadStream.BaseStream.Length || metadataStream.BaseStream.Position != metadataStream.BaseStream.Length))
+				throw new InvalidDataException("Legacy archive directory does not cover its data block.");
 			return new FlatArchive(entries.ToArray());
 		}
 
-		private static FileMetaData DetectPayloadMetadata(BinaryReader payload, uint version, ulong uid, int length, long offset)
+		private static (FileMetaData Meta, int HeaderLength) ReadLegacyMember(BinaryReader payload, ulong uid, int length, long offset)
 		{
 			var original = payload.BaseStream.Position;
 			try
 			{
 				payload.BaseStream.Position = offset;
-				var directMagic = length >= 4 ? payload.ReadUInt32() : 0;
-				if (Enum.IsDefined(typeof(Magic), (ulong)directMagic) || MagicHelper.UnknownMagics.Contains(directMagic))
-					return FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), directMagic, uid);
+				var type = length >= sizeof(uint) ? payload.ReadUInt32() : 0;
+				if (length >= 20)
+				{
+					var bodySize = payload.ReadUInt32(); // Includes the UID.
+					var nameSize = payload.ReadUInt32();
+					if (bodySize >= 8 && nameSize <= ushort.MaxValue && 12L + nameSize + bodySize == length)
+					{
+						payload.BaseStream.Position = offset;
+						var metadata = FileMetaData.ReadLegacy(payload, hasNames: true);
+						if (metadata.Uid == uid)
+							return (metadata, 20 + (int)nameSize);
+					}
+				}
+				return (FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), type, uid), 0);
+			}
+			finally { payload.BaseStream.Position = original; }
+		}
+
+		private static (FileMetaData Meta, int HeaderLength) DetectPayloadMetadata(BinaryReader payload, uint version, ulong uid, int length, long offset)
+		{
+			var original = payload.BaseStream.Position;
+			try
+			{
+				if (length >= 20)
+				{
+					payload.BaseStream.Position = offset;
+					var nameLen = payload.ReadUInt16();
+					var containerType = payload.ReadUInt16();
+
+					// In v31+, embedded FileMetaData has containerType == 2 and a valid name length
+					if (containerType == 2 && nameLen + 20 <= length)
+					{
+						payload.BaseStream.Position = offset;
+						try
+						{
+							var embedded = FileMetaData.Read(payload, version);
+							if (embedded.FileType != 0 && (version < 34 || embedded.Uid == uid))
+							{
+								var headerLen = (int)(payload.BaseStream.Position - offset);
+								return (FileMetaData.CreateDetected(
+									string.IsNullOrWhiteSpace(embedded.FileName) ? uid.ToString("X16") : embedded.FileName,
+									checked((uint)length + 8), embedded.FileType, uid), headerLen);
+							}
+						}
+						catch
+						{
+						}
+					}
+				}
 
 				payload.BaseStream.Position = offset;
-				var embedded = FileMetaData.Read(payload, version);
-				return FileMetaData.CreateDetected(string.IsNullOrWhiteSpace(embedded.FileName) ? uid.ToString("X16") : embedded.FileName,
-					checked((uint)length + 8), embedded.FileType, uid);
+				var directMagic = length >= 4 ? payload.ReadUInt32() : 0;
+				if (directMagic != 0 && directMagic != (uint)Magic.Metadata &&
+				    (Enum.IsDefined(typeof(Magic), (ulong)directMagic) || MagicHelper.UnknownMagics.Contains(directMagic)))
+				{
+					return (FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), directMagic, uid), 0);
+				}
+
+				payload.BaseStream.Position = offset;
+				if (version >= 34)
+					return (FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), directMagic, uid), 0);
+				var fallback = FileMetaData.Read(payload, version);
+				var fallbackHeaderLen = (int)(payload.BaseStream.Position - offset);
+				return (FileMetaData.CreateDetected(
+					string.IsNullOrWhiteSpace(fallback.FileName) ? uid.ToString("X16") : fallback.FileName,
+					checked((uint)length + 8), fallback.FileType, uid), fallbackHeaderLen);
 			}
 			catch
 			{
-				return FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), 0, uid);
+				return (FileMetaData.CreateDetected(uid.ToString("X16"), checked((uint)length + 8), 0, uid), 0);
 			}
 			finally { payload.BaseStream.Position = original; }
 		}
@@ -104,7 +177,16 @@ namespace RainbowForge.Archive
 		{
 			var entry = Entries.FirstOrDefault(candidate => candidate.MetaData.Uid == entryUid);
 			var reader = GetEntryStream(archiveStream, entryUid);
-			if (entry == null || reader == null || version is < 31 or > 33 || reader.BaseStream.Length < sizeof(uint))
+			if (entry == null || reader == null)
+				return reader;
+
+			if (entry.HeaderLength > 0 && entry.HeaderLength < reader.BaseStream.Length)
+			{
+				reader.BaseStream.Position = entry.HeaderLength;
+				return reader;
+			}
+
+			if (version < 31 || reader.BaseStream.Length < sizeof(uint))
 				return reader;
 
 			var directMagic = reader.ReadUInt32();

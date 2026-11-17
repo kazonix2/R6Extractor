@@ -7,13 +7,58 @@ namespace RainbowForge.Core
 	public class DepGraph
 	{
 		public DepGraphEntry[] Structs { get; private set; }
+		public byte Version { get; }
 
-		private DepGraph(DepGraphEntry[] structs)
+		private DepGraph(byte version, DepGraphEntry[] structs)
 		{
+			Version = version;
 			Structs = structs;
 		}
 
 		public static DepGraph Read(BinaryReader r)
+		{
+			using var stream = Unpack(r);
+			using var depGraphStream = new BinaryReader(stream);
+			var version = depGraphStream.ReadByte();
+			var structs = new DepGraphEntry[(stream.Length - 1) / DepGraphEntry.SizeInBytes];
+			for (var i = 0; i < structs.Length; i++)
+				structs[i] = depGraphStream.ReadStruct<DepGraphEntry>(DepGraphEntry.SizeInBytes);
+			return new DepGraph(version, structs);
+		}
+
+		public static Stream Unpack(BinaryReader r)
+		{
+			var input = r.BaseStream;
+			var start = input.Position;
+			var end = input.Length;
+			if (start < end && r.ReadByte() == 1)
+			{
+				// Closed Alpha stores version-1 graphs directly, without a chunk envelope.
+				var size = end - start;
+				if (size > 128 * 1024 * 1024 || (size - 1) % DepGraphEntry.SizeInBytes != 0)
+					throw new InvalidDataException("Unexpected raw dependency graph payload layout.");
+				input.Position = start;
+				var decodedBytes = new byte[(int)size];
+				input.ReadExactly(decodedBytes);
+				return new MemoryStream(decodedBytes, writable: false);
+			}
+			input.Position = start;
+			var block = ChunkedDataBlock.TryReadVerifiedEnvelope(r, end, out _);
+			if (block == null)
+				block = ReadLegacyBlock(r);
+			if (r.BaseStream.Position != end)
+				throw new InvalidDataException("Trailing dependency graph bytes.");
+			var decoded = block.GetDataStream(r);
+			if (decoded.ReadByte() is not (1 or 2) || (decoded.Length - 1) % DepGraphEntry.SizeInBytes != 0)
+			{
+				decoded.Dispose();
+				throw new InvalidDataException("Unexpected dependency graph payload layout.");
+			}
+			decoded.Position = 0;
+			return decoded;
+		}
+
+		private static ChunkedDataBlock ReadLegacyBlock(BinaryReader r)
 		{
 			var containerMagic = (ContainerMagic)r.ReadUInt32();
 			if (containerMagic != ContainerMagic.File)
@@ -30,20 +75,7 @@ namespace RainbowForge.Core
 			if (assetDeserializerType != 3)
 				throw new InvalidDataException($"Expected chunked asset deserializer magic, found 0x{assetDeserializerType:X4}");
 
-			var dataBlock = ChunkedDataBlock.Read(r);
-			var stream = dataBlock.GetDataStream(r);
-
-			using var depGraphStream = new BinaryReader(stream);
-			var x00 = depGraphStream.ReadByte(); // == 2
-
-			var numStructs = stream.Length / DepGraphEntry.SizeInBytes;
-
-			var structs = new DepGraphEntry[numStructs];
-
-			for (var i = 0; i < numStructs; i++)
-				structs[i] = depGraphStream.ReadStruct<DepGraphEntry>(DepGraphEntry.SizeInBytes);
-
-			return new DepGraph(structs);
+			return ChunkedDataBlock.Read(r);
 		}
 	}
 
@@ -58,5 +90,7 @@ namespace RainbowForge.Core
 		[FieldOffset(20)] public ushort Unk1;
 		[FieldOffset(22)] public byte Unk2;
 		[FieldOffset(23)] public byte Unk3;
+
+		public readonly ulong Flags => ChildType | ((ulong)Unk1 << 32) | ((ulong)Unk2 << 48) | ((ulong)Unk3 << 56);
 	}
 }

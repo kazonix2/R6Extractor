@@ -2,13 +2,13 @@
 
     <PropertyGroup>
         <TargetFramework>net10.0</TargetFramework>
+        <!-- Source ownership moved to RainbowScimitar. Keep this project as a
+             source-compatible reference for existing consumers during the Rust migration. -->
+        <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="JeremyAnsel.Media.WavefrontObj" Version="2.0.19" />
-        <PackageReference Include="Pfim" Version="0.10.3" />
-        <PackageReference Include="Zstandard.Net" Version="1.1.7" />
-        <PackageReference Include="System.Drawing.Common" Version="6.0.0" />
+        <ProjectReference Include="..\RainbowScimitar\RainbowScimitar.csproj" />
     </ItemGroup>
 
 </Project>

@@ -23,8 +23,18 @@ namespace Prism.Controls;
 /// </summary>
 public sealed class AssetTreeView : TreeListView
 {
-	private readonly ConcurrentDictionary<ulong, (ulong Magic, bool IsArchive)> _detectedTypes = new();
-	private Forge _openedForge;
+	private readonly ConcurrentDictionary<Entry, (ulong Magic, bool IsArchive)> _detectedTypes = new();
+	private Dictionary<Entry, Forge> _owners = new();
+	private readonly Dictionary<FlatArchiveEntry, Entry> _parents = new();
+
+	internal Forge GetForge(object model) => model switch
+	{
+		Entry entry => _owners.GetValueOrDefault(entry),
+		FlatArchiveEntry child when _parents.TryGetValue(child, out var parent) => _owners.GetValueOrDefault(parent),
+		_ => null
+	};
+
+	internal Entry GetParent(FlatArchiveEntry entry) => _parents.GetValueOrDefault(entry);
 	private Dictionary<ulong, ulong> _flatArchiveEntryMap = new();
 
 	public AssetTreeView()
@@ -33,6 +43,7 @@ public sealed class AssetTreeView : TreeListView
 		View = View.Details;
 		ShowGroups = false;
 		FullRowSelect = true;
+		MultiSelect = true;
 		UseFiltering = true;
 		UseHotItem = false;
 		UseHyperlinks = false;
@@ -64,7 +75,7 @@ public sealed class AssetTreeView : TreeListView
 			AspectToStringConverter = value =>
 			{
 				var (magic, uid) = ((ulong Magic, ulong Uid))value;
-				return FormatType(magic, uid);
+				return FormatType(magic);
 			}
 		});
 
@@ -92,6 +103,12 @@ public sealed class AssetTreeView : TreeListView
 			AspectToStringConverter = value => value is ulong uid ? $"{uid:X16}" : string.Empty
 		});
 
+		Columns.Add(new OLVColumn("Forge", null)
+		{
+			Width = 250,
+			AspectGetter = model => Path.GetFileName(GetForge(model)?.SourcePath)
+		});
+
 		CanExpandGetter = model => model is Entry entry && GetDetectedType(entry).IsArchive;
 		ChildrenGetter = LoadChildren;
 		CellRightClick += OnCellRightClick;
@@ -101,10 +118,20 @@ public sealed class AssetTreeView : TreeListView
 
 	public void SetObjects(IEnumerable collection, Forge forge, Dictionary<ulong, ulong> flatArchiveEntryMap)
 	{
-		_openedForge = forge;
+		SetForgeObjects(collection.Cast<Entry>().ToDictionary(entry => entry, _ => forge), flatArchiveEntryMap);
+	}
+
+	internal void SetForges(IEnumerable<Forge> forges) => SetForgeObjects(forges
+		.SelectMany(forge => forge.Entries.Select(entry => (entry, forge)))
+		.ToDictionary(pair => pair.entry, pair => pair.forge), null);
+
+	private void SetForgeObjects(Dictionary<Entry, Forge> owners, Dictionary<ulong, ulong> flatArchiveEntryMap)
+	{
+		_owners = owners;
+		_parents.Clear();
 		_flatArchiveEntryMap = flatArchiveEntryMap ?? new Dictionary<ulong, ulong>();
 		_detectedTypes.Clear();
-		base.SetObjects(collection);
+		base.SetObjects(owners.Keys);
 		RebuildAll(true);
 		SyncVirtualListSize();
 	}
@@ -112,6 +139,14 @@ public sealed class AssetTreeView : TreeListView
 	public void LoadForge(Forge forge)
 	{
 		SetObjects(forge.Entries, forge, new Dictionary<ulong, ulong>());
+	}
+
+	protected override void UpdateHotItem(System.Drawing.Point point)
+	{
+		// ObjectListView otherwise hit-tests native rows while replacing the tree model,
+		// even when all of the features that use hot items are disabled.
+		if (UseHotItem || UseHyperlinks || UseHotControls)
+			base.UpdateHotItem(point);
 	}
 
 	public void SelectFirstNode()
@@ -140,16 +175,17 @@ public sealed class AssetTreeView : TreeListView
 
 	private IEnumerable LoadChildren(object model)
 	{
-		if (_openedForge == null || model is not Entry entry || !GetDetectedType(entry).IsArchive)
+		if (model is not Entry entry || GetForge(entry) is not { } forge || !GetDetectedType(entry).IsArchive)
 			return null;
 
-		if (_openedForge.GetContainer(entry.Uid) is not ForgeAsset forgeAsset)
+		if (forge.GetContainer(entry.Uid) is not ForgeAsset forgeAsset)
 			throw new InvalidDataException("Container is not an asset.");
 
-		using var payload = forgeAsset.GetDataStream(_openedForge);
-		var archive = FlatArchive.Read(_openedForge, forgeAsset, payload);
+		using var payload = forgeAsset.GetDataStream(forge);
+		var archive = FlatArchive.Read(forge, forgeAsset, payload);
 		foreach (var archiveEntry in archive.Entries)
 		{
+			_parents[archiveEntry] = entry;
 			if (archiveEntry.MetaData != null)
 				_flatArchiveEntryMap[archiveEntry.MetaData.Uid] = entry.Uid;
 		}
@@ -158,48 +194,22 @@ public sealed class AssetTreeView : TreeListView
 
 	private (ulong Magic, bool IsArchive) GetDetectedType(Entry entry)
 	{
-		return _detectedTypes.GetOrAdd(entry.Uid, _ =>
+		return _detectedTypes.GetOrAdd(entry, _ =>
 		{
-			if (_openedForge == null)
+			if (GetForge(entry) is not { } forge)
 			{
 				var metadataMagic = (ulong)(entry.MetaData?.FileType ?? 0);
 				return (metadataMagic, MagicHelper.GetFiletype(metadataMagic) == AssetType.FlatArchive);
 			}
 
-			var magic = AssetTypeDetector.DetectMagic(_openedForge, entry, inspectPayload: true);
-			var isArchive = AssetTypeDetector.DetectAssetType(_openedForge, entry, inspectPayload: true) == AssetType.FlatArchive;
+			var magic = AssetTypeDetector.DetectMagic(forge, entry, inspectPayload: true);
+			var isArchive = AssetTypeDetector.DetectAssetType(forge, entry, inspectPayload: true) == AssetType.FlatArchive;
 			return (magic, isArchive);
 		});
 	}
 
-	private string FormatType(ulong magic, ulong uid)
-	{
-		if (magic == ulong.MaxValue)
-			return string.Empty;
-
-		if (Enum.IsDefined(typeof(Magic), magic))
-		{
-			var known = (Magic)magic;
-			if (known == Magic.Metadata && _openedForge != null && uid != 0)
-			{
-				try
-				{
-					return _openedForge.GetContainer(uid) switch
-					{
-						Hash => "[HASH]",
-						Descriptor => "[DESCRIPTOR]",
-						_ => known.ToString()
-					};
-				}
-				catch
-				{
-				}
-			}
-			return known.ToString();
-		}
-
-		return $"{magic:X8}";
-	}
+	private static string FormatType(ulong magic) => magic == ulong.MaxValue ? string.Empty :
+		Enum.IsDefined(typeof(Magic), magic) ? ((Magic)magic).ToString() : $"{magic:X8}";
 
 	private bool MatchesFilter(object model, string filter)
 	{
@@ -222,7 +232,7 @@ public sealed class AssetTreeView : TreeListView
 			}
 			else if (token.StartsWith('?'))
 			{
-				if (!FormatType(magic, uid).Contains(token[1..], StringComparison.OrdinalIgnoreCase))
+				if (!FormatType(magic).Contains(token[1..], StringComparison.OrdinalIgnoreCase))
 					return false;
 			}
 			else if (!filename.Contains(token, StringComparison.OrdinalIgnoreCase))

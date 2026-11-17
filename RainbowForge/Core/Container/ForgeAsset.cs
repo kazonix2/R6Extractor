@@ -19,8 +19,29 @@ namespace RainbowForge.Core.Container
 			AssetBlock = assetBlock;
 		}
 
-		public static ForgeAsset Read(BinaryReader r, Entry entry)
+		public static ForgeAsset Read(BinaryReader r, Entry entry) => Read(r, entry, requireVerifiedEnvelope: false);
+
+		internal static ForgeAsset Read(BinaryReader r, Entry entry, bool requireVerifiedEnvelope)
 		{
+			if (entry.HasExactChunkBounds || requireVerifiedEnvelope)
+			{
+				// GetContainer has already read the low word of the first block magic.
+				r.BaseStream.Position = entry.Offset;
+				var first = ChunkedDataBlock.TryReadVerifiedEnvelope(r, entry.End, out _);
+				if (first != null)
+				{
+					if (r.BaseStream.Position == entry.End)
+						return new ForgeAsset(null, 0, first);
+					var second = ChunkedDataBlock.TryReadVerifiedEnvelope(r, entry.End, out var secondMagic);
+					if (second == null || r.BaseStream.Position != entry.End)
+						throw new InvalidDataException("The second block does not fill the Forge allocation.");
+					return new ForgeAsset(first, secondMagic, second);
+				}
+				if (requireVerifiedEnvelope)
+					throw new InvalidDataException("Unsupported LZO chunk envelope.");
+				r.BaseStream.Position = entry.Offset + sizeof(uint);
+			}
+
 			var magic = r.ReadUInt32();
 			// MagicHelper.AssertEquals(Magic.FileContainer, magic);
 

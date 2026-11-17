@@ -4,11 +4,11 @@ namespace RainbowForge.Model
 {
 	public class TrianglePointer
 	{
-		public ushort A { get; }
-		public ushort B { get; }
-		public ushort C { get; }
+		public int A { get; }
+		public int B { get; }
+		public int C { get; }
 
-		public TrianglePointer(ushort a, ushort b, ushort c)
+		public TrianglePointer(int a, int b, int c)
 		{
 			A = a;
 			B = b;

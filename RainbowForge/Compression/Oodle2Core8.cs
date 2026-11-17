@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -114,17 +114,18 @@ namespace RainbowForge.Compression
 		public static byte[] Decompress(byte[] compressedData, int decompressedLength, FuzzSafe fuzzSafe = FuzzSafe.No, CheckCRC checkCrc = CheckCRC.No, Verbosity verbosity = Verbosity.None,
 			ThreadPhase threadPhase = ThreadPhase.Unthreaded)
 		{
-			var decompressionBuffer = new byte[decompressedLength];
+			OodleHelper.EnsureOodleLoaded();
+
+			// Oodle's decoder may use up to 64 bytes of slack at the end of the output buffer.
+			var decompressionBuffer = new byte[checked(decompressedLength + 64)];
 
 			var decodedBytes = OodleLZ_Decompress(compressedData, compressedData.Length, decompressionBuffer, decompressedLength, fuzzSafe, checkCrc, verbosity,
 				IntPtr.Zero, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, threadPhase);
 
 			if (decodedBytes != decompressedLength)
-			{
-				File.WriteAllBytes("failed.bin", compressedData);
-				throw new IOException("Failed to decompress");
-			}
+				throw new InvalidDataException($"Oodle decoded {decodedBytes} bytes, expected {decompressedLength}.");
 
+			Array.Resize(ref decompressionBuffer, decompressedLength);
 			return decompressionBuffer;
 		}
 	}

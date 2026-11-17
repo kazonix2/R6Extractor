@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Siege UI resources</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="fonts.css">
+  <script defer src="ui-data.js"></script>
+  <script defer src="ui.js"></script>
+</head>
+<body>
+  <header><h1>Siege UI resources</h1><a href="ui.json" download>Download manifest</a></header>
+  <main>
+    <form id="filters" role="search">
+      <label>Search <input id="query" type="search" placeholder="UID, name, or format"></label>
+      <label>Resource type <select id="type"><option value="">All types</option></select></label>
+    </form>
+    <p id="results" aria-live="polite"></p>
+    <div id="resources"></div>
+    <button id="more" type="button" hidden>Show more</button>
+  </main>
+</body>
+</html>
